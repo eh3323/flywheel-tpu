@@ -13,7 +13,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from .block_sizes import NUM_SUBLANES
+from .block_sizes import hbm_bf16_tile_rows
 
 
 class PerSeqIntervals(NamedTuple):
@@ -273,9 +273,11 @@ def align_to_sublane_tile(token: jax.Array) -> jax.Array:
   Mosaic rejects a dynamic second-minor offset it cannot prove tile-aligned,
   and it can prove nothing about a cu_seqlens scalar read from SMEM, so the
   per-seq schedule puts every window base on this grid and asserts it with
-  pl.multiple_of.
+  pl.multiple_of. The tile is hbm_bf16_tile_rows() deep: 8 rows on v6e, 16 on
+  v7x.
   """
-  return (token // NUM_SUBLANES) * NUM_SUBLANES
+  tile_rows = hbm_bf16_tile_rows()
+  return (token // tile_rows) * tile_rows
 
 
 def per_seq_qblk_prefix(cu_seqlens_q: jax.Array, bq: int) -> jax.Array:
@@ -322,23 +324,24 @@ def make_per_seq_fwd_schedule(
   offset = cu_k[r + 1] - cu_q[r + 1]. None is unbounded, and causal is
   (None, 0). Empty sequences own no si.
 
-  Aligning a base down drags up to 7 rows of the previous sequence into the
-  first block, and the last block runs past q_end. Those q rows are garbage:
-  fwd_body blends rows [q_token, blend_start) from the previous block's stage
-  before the packed write, and tail rows are overwritten by the next block or,
-  past cu_q[-1] (packed_q_end), written as out = 0, lse = -inf. Stray kv
-  columns and the window edges are masked through q_bounds, so this schedule
-  needs no bounds operand.
+  Aligning a base down drags up to hbm_bf16_tile_rows() - 1 rows of earlier
+  sequences into the first block, and the last block runs past q_end. Those q
+  rows are garbage: fwd_body blends rows [q_token, blend_start) from the
+  previous block's stage before the packed write, and tail rows are
+  overwritten by the next block or, past cu_q[-1] (packed_q_end), written as
+  out = 0, lse = -inf. Stray kv columns and the window edges are masked
+  through q_bounds, so this schedule needs no bounds operand.
   """
   # Note (david): pl.multiple_of is an unchecked hint, and a lying hint
   # corrupts data silently instead of failing the verifier. A base of
   # align(cu) + i * bq is tile-aligned only while bq and bkv are, and the
   # clamped bases (padded_total - block) need the padded totals aligned too.
-  if (bq % NUM_SUBLANES or bkv % NUM_SUBLANES
-      or padded_total_q % NUM_SUBLANES or padded_total_k % NUM_SUBLANES):
+  tile_rows = hbm_bf16_tile_rows()
+  if (bq % tile_rows or bkv % tile_rows
+      or padded_total_q % tile_rows or padded_total_k % tile_rows):
     raise ValueError(
         f"{bq=}, {bkv=}, {padded_total_q=} and {padded_total_k=} must be"
-        f" multiples of {NUM_SUBLANES}."
+        f" multiples of {tile_rows}."
     )
   num_kv_blocks = padded_total_k // bkv
 
@@ -376,12 +379,12 @@ def make_per_seq_fwd_schedule(
     return lo, hi, ctx
 
   def _q_token(ctx):
-    return pl.multiple_of(ctx.q_window_start, NUM_SUBLANES)
+    return pl.multiple_of(ctx.q_window_start, tile_rows)
 
   def _kv_token(kv, ctx):
     return pl.multiple_of(
         jnp.minimum(ctx.kv_window_base + kv * bkv, padded_total_k - bkv),
-        NUM_SUBLANES)
+        tile_rows)
 
   def _block_flags(_, kv, ctx):
     k_first = ctx.kv_window_base + kv * bkv

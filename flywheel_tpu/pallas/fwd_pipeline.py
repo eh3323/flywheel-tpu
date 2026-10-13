@@ -21,6 +21,7 @@ from .block_sizes import (
   QKVLayout,
   TokenMajorInfo,
   from_head_minor,
+  hbm_bf16_tile_rows,
   round_up,
   vmem_limit_bytes,
 )
@@ -49,7 +50,7 @@ SEM_ROTARY_K = NUM_SEMS + 1
 # of 16 as (16, 128) (v7x does; v6e may keep (8, 128)), and a dynamic vector
 # load or store must start on that tile. Dynamic row accesses into bf16 stages
 # therefore step in whole 16-row tiles, which is legal under either tiling;
-# HBM DMAs stay on the NUM_SUBLANES grid.
+# HBM DMAs stay on the hbm_bf16_tile_rows() grid.
 BF16_TILE_ROWS = 2 * NUM_SUBLANES
 
 # Note (david): the guard keeps score <= e^T, row_sum <= kv_seq_len * e^T and
@@ -1048,14 +1049,14 @@ def fwd_body(
         _finalize_head(g)
 
     if is_per_seq:
-      # Note (david): a per-seq window sits on the 8-row grid and may reach
-      # below blend_start into rows the previous output block computed
-      # correctly. That stage is still resident (num_stages >= 2 and only its
-      # outbound DMA reads it), so the rows are copied over from it. The bf16
-      # stage is accessed in whole 16-row tiles, but the two windows are only
-      # 8-aligned apart, so each own tile reads the two source tiles it
-      # straddles and picks their 8-row halves in f32, where 8 rows are one
-      # whole (8, 128) tile.
+      # Note (david): a per-seq window sits on the hbm_bf16_tile_rows() grid
+      # and may reach below blend_start into rows the previous output block
+      # computed correctly. That stage is still resident (num_stages >= 2 and
+      # only its outbound DMA reads it), so the rows are copied over from it.
+      # The bf16 stage is accessed in whole 16-row tiles, but the two windows
+      # can be only 8-aligned apart, so each own tile reads the two source
+      # tiles it straddles and picks their 8-row halves in f32, where 8 rows
+      # are one whole (8, 128) tile.
       num_blend_rows = schedule.blend_start(ctx) - q_tok
 
       @pl.when(jnp.logical_and(is_last, num_blend_rows > 0))
@@ -1237,12 +1238,12 @@ def fwd_body(
     # Note (david): packed padding rows own no q block, so once every output
     # DMA has landed they are written from a cleared stage. The last block
     # already zeroed its window's padding rows, so the fill starts at the next
-    # 8-row tile; with no block at all, cu_seqlens_q is all 0 and so is that
+    # HBM tile; with no block at all, cu_seqlens_q is all 0 and so is that
     # tile.
     packed_q_end = schedule.packed_q_end
     padded_total_q = o_hbm.shape[-2]
-    fill_start = (
-        (packed_q_end + NUM_SUBLANES - 1) // NUM_SUBLANES * NUM_SUBLANES)
+    tile_rows = hbm_bf16_tile_rows()
+    fill_start = (packed_q_end + tile_rows - 1) // tile_rows * tile_rows
     num_fills = pl.cdiv(jnp.maximum(padded_total_q - fill_start, 0), bq)
 
     @pl.when(num_fills > 0)
@@ -1252,9 +1253,9 @@ def fwd_body(
         lse_stage[0] = jnp.full(lse_stage.shape[1:], -jnp.inf, jnp.float32)
 
     def _fill_rows(fill_index, carry):
-      row_start = pl.multiple_of(fill_start + fill_index * bq, NUM_SUBLANES)
+      row_start = pl.multiple_of(fill_start + fill_index * bq, tile_rows)
       num_fill_rows = pl.multiple_of(
-          jnp.minimum(padded_total_q - row_start, bq), NUM_SUBLANES)
+          jnp.minimum(padded_total_q - row_start, bq), tile_rows)
       fill_rows = pl.ds(0, num_fill_rows)
       # Note (david): only a head-major fold stages a leading fold axis; a
       # token-major fold rides the lanes.

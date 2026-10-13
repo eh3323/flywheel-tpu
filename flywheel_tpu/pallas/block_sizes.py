@@ -7,6 +7,7 @@ import math
 from collections.abc import Sequence
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from jax.experimental.pallas import tpu as pltpu
 
@@ -36,6 +37,26 @@ def vmem_limit_bytes() -> int:
   if jax.default_backend() != "tpu":
     return MAX_VMEM_LIMIT_BYTES
   return min(MAX_VMEM_LIMIT_BYTES, pltpu.get_tpu_info().vmem_capacity_bytes)
+
+
+@functools.cache
+def hbm_bf16_tile_rows() -> int:
+  """Rows a traced window into a bf16 HBM operand has to be aligned to.
+
+  It is TpuInfo.get_sublane_tiling for bf16. Before v7x that is 8: XLA tiles
+  a bf16 HBM buffer (8, 128), unless
+  xla_tpu_enable_large_2nd_minor_layout_for_x16 is set. On v7x it is 16: There
+  XLA lays out a bf16 HBM buffer whose row count is a multiple of 16 in one of
+  two ways:
+  - (16, 128) tiles when another op of the jitted program reads the buffer,
+    as with a kernel's output inside a model;
+  - (8, 128) tiles when the jitted program returns the buffer, as when a
+    test calls the kernel alone.
+  A window that starts on a multiple of 16 rows is aligned under both.
+  """
+  if jax.default_backend() != "tpu":
+    return NUM_SUBLANES
+  return pltpu.get_tpu_info().get_sublane_tiling(jnp.bfloat16)
 
 MIN_NUM_STAGES = 2
 # Note (david): the KV-cache kernel issues the next block's DMA into slot
