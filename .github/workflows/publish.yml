@@ -1,0 +1,66 @@
+# Push a v* tag to release: build the sdist and wheel, publish them to PyPI
+# through Trusted Publishing, then create the GitHub Release with the same files.
+name: publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+      - run: uv build
+      # The tag, pyproject.toml and flywheel_tpu.__version__ must name one version.
+      - name: Check the version against the tag
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          test -f "dist/flywheel_tpu-${version}-py3-none-any.whl" || {
+            echo "dist/ has no wheel for ${version}:" >&2; ls dist >&2; exit 1; }
+          grep -qx "__version__ = \"${version}\"" flywheel_tpu/__init__.py || {
+            echo "flywheel_tpu/__init__.py does not set __version__ to ${version}" >&2; exit 1; }
+      - run: uvx twine check --strict dist/*
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/flywheel-tpu/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - uses: astral-sh/setup-uv@v10.2.0
+      - run: uv publish --trusted-publishing always dist/*
+
+  github-release:
+    needs: pypi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME"
+          --verify-tag --generate-notes

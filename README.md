@@ -6,6 +6,9 @@
 </p>
 
 ## News
+- [2026/10] FlyWheel 0.2.0 is released: faster chunked prefill, prefix caching
+  and decode over a paged KV cache, now ahead of RPA v3 on TPU v7x (up to 2.32x
+  on chunked prefill and 1.14x on decode).
 - [2026/10] Added [TPU v7x benchmark results](README_v7x.md) for MHA/GQA 
   softmax attention. Thanks to [@lk-chen](https://github.com/lk-chen) for 
   testing and contributing the results!
@@ -570,6 +573,6 @@ If you use FlyWheel in your research, please cite:
   author       = {Zishuo Bao and Zeshen Zhang and Yucheng Lu},
   year         = {2026},
   howpublished = {\url{https://github.com/heavyball-research/flywheel-tpu}},
-  note         = {Version 0.1.0}
+  note         = {Version 0.2.0}
 }
 ```
