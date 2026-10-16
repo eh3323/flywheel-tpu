@@ -47,7 +47,11 @@ STREAM_REC_IN = 4
 STREAM_OUT = 5
 STREAM_CONV_OUT = 6
 STREAM_REC_OUT = 7
-NUM_STREAMS = 8
+STREAM_REPLAY_IN = 8
+STREAM_REPLAY_OUT = 9
+STREAM_SHADOW_IN = 10
+STREAM_SHADOW_OUT = 11
+NUM_STREAMS = 12
 
 
 class GDNMode(enum.StrEnum):
@@ -70,6 +74,7 @@ class Dtypes:
     compute: jnp.dtype
     recurrent_state: jnp.dtype
     conv_state: jnp.dtype
+    replay_record: jnp.dtype
 
 
 @jax.tree_util.register_dataclass
@@ -99,6 +104,23 @@ class GDNConfig:
     # without speculative decoding, so shapes and loops size off it
     # unconditionally and the extra axis folds away.
     window_size: int = 1
+    # Note (david): ReplaySSM keeps up to replay_window records of recent
+    # tokens beside the checkpoint, so a decode step writes the state only
+    # when they overflow. 0 turns it off.
+    replay_window: int = 0
+    # Note (david): a replay decode reads S only through a default-precision
+    # dot, which rounds it to bf16 anyway, so it reads a bf16 shadow of the
+    # f32 checkpoint at half the bytes; every checkpoint write also writes the
+    # shadow.
+    has_shadow: bool = False
+
+    def __post_init__(self) -> None:
+        assert self.has_shadow or not self.is_replay, (
+            "a replay decode reads the checkpoint through its shadow")
+
+    @property
+    def is_replay(self) -> bool:
+        return self.mode == GDNMode.BATCHED and self.replay_window > 0
 
     @property
     def chunk_size(self) -> int:
@@ -158,6 +180,24 @@ class GDNConfig:
         num_lanes = pltpu.get_tpu_info().num_lanes
         return pl.cdiv(self.num_v_heads, num_lanes) * num_lanes
 
+    @property
+    def record_k_offset(self) -> int:
+        return self.v_dim_size
+
+    @property
+    def record_g_offset(self) -> int:
+        return self.v_dim_size + self.num_kq_heads * self.kq_head_dim
+
+    @property
+    def record_dim(self) -> int:
+        """Lanes of one replay record [u | k | g].
+
+        u is the token's delta-rule correction per value head, k its
+        normalized key per kq head and g its log decay per value head, padded
+        to whole lane tiles.
+        """
+        return self.record_g_offset + self.aligned_num_v_heads
+
     def get_scratch_shape_dict(self) -> dict[str, pl.MemoryRef | None]:
         """VMEM rings, inter-tile carries and DMA semaphores of the pipeline.
 
@@ -171,6 +211,9 @@ class GDNConfig:
                     self.aligned_num_v_heads)
         conv_state_shape = (self.prev_kernel_size, self.dim_size)
         rec_state_shape = (self.num_v_heads, self.kq_head_dim, self.v_head_dim)
+        # Note (david): a replay tile writes at most one checkpoint per
+        # sequence, the flushed one, whatever its window.
+        num_rec_out = 1 if self.is_replay else self.window_size
 
         # Note (david): a BATCHED tile holds whole sequences, so only PER_SEQ
         # carries state from one tile to the next.
@@ -182,6 +225,30 @@ class GDNConfig:
         else:
             carry_conv_scratch = None
             carry_recurrent_scratch = None
+
+        # Note (david): the record axis is tiled, so record DMAs move whole
+        # SUBLANE_ALIGN-row windows and a slot holds the full buffer. Only a
+        # replay decode reads the shadow; a PER_SEQ tile starts from the f32
+        # checkpoint.
+        if self.is_replay:
+            replay_shape = (slots, tile_seqs, self.replay_window,
+                            self.record_dim)
+            replay_in_buf = pltpu.VMEM(replay_shape, self.dtypes.replay_record)
+            replay_out_buf = pltpu.VMEM(replay_shape,
+                                        self.dtypes.replay_record)
+            shadow_in_buf = pltpu.VMEM((slots, tile_seqs, 1, *rec_state_shape),
+                                       jnp.bfloat16)
+        else:
+            replay_in_buf = None
+            replay_out_buf = None
+            shadow_in_buf = None
+
+        if self.has_shadow:
+            shadow_out_buf = pltpu.VMEM(
+                (slots, tile_seqs, num_rec_out, *rec_state_shape),
+                jnp.bfloat16)
+        else:
+            shadow_out_buf = None
 
         return {
             "qkv_buf": pltpu.VMEM(
@@ -197,8 +264,12 @@ class GDNConfig:
                 (slots, tile_seqs, self.window_size, *conv_state_shape),
                 self.dtypes.conv_state),
             "rec_out_buf": pltpu.VMEM(
-                (slots, tile_seqs, self.window_size, *rec_state_shape),
+                (slots, tile_seqs, num_rec_out, *rec_state_shape),
                 self.dtypes.recurrent_state),
+            "replay_in_buf": replay_in_buf,
+            "replay_out_buf": replay_out_buf,
+            "shadow_in_buf": shadow_in_buf,
+            "shadow_out_buf": shadow_out_buf,
             "out_buf": pltpu.VMEM(
                 (slots, self.out_window_rows, self.v_dim_size),
                 self.dtypes.act_out),

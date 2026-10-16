@@ -1069,3 +1069,193 @@ def recurrent_kda(
         seq_states.append(window_states)
 
     return jnp.stack(seq_outs, axis=0), jnp.stack(seq_states, axis=0)
+
+
+def replay_record_parts(
+        records: jax.Array, num_records: jax.Array,
+        cfg: config.KDAConfig) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Split a [replay_window, record_dim] record buffer into u [num_v_heads,
+    rows, v_head_dim], k [num_kq_heads, rows, kq_head_dim] and g
+    [num_v_heads, rows, kq_head_dim]; rows from num_records on are zero."""
+    d_k, d_v = cfg.kq_head_dim, cfg.v_head_dim
+    # Note (david): rows past num_records may hold NaN from stale VMEM, so they
+    # are selected away, not scaled: 0 * NaN is NaN.
+    record_row = jax.lax.broadcasted_iota(jnp.int32, records.shape, 0)
+    records = jnp.where(record_row < num_records, records, 0)
+    u_records = jnp.stack([
+        records[:, head * d_v:(head + 1) * d_v]
+        for head in range(cfg.num_v_heads)
+    ])
+    k_records = jnp.stack([
+        records[:, cfg.record_k_offset + head * d_k:
+                cfg.record_k_offset + (head + 1) * d_k]
+        for head in range(cfg.num_kq_heads)
+    ])
+    g_records = jnp.stack([
+        records[:, cfg.record_g_offset + head * d_k:
+                cfg.record_g_offset + (head + 1) * d_k]
+        for head in range(cfg.num_v_heads)
+    ])
+    return u_records, k_records, g_records
+
+
+def replay_kda(
+    q_chunked: jax.Array,
+    k_chunked: jax.Array,
+    v_chunked: jax.Array,
+    b_rows: jax.Array,
+    g_chunked: jax.Array,
+    num_tokens: jax.Array,
+    num_records: jax.Array,
+    records: jax.Array,
+    shadow_ref: jax.Ref,
+    a_log: jax.Array,
+    dt_bias: jax.Array,
+    cfg: config.KDAConfig,
+) -> tuple[jax.Array, jax.Array]:
+    """One ReplaySSM step of one sequence: outputs and new records, no state.
+
+    With G the per-key-channel cumulative log decay over the committed
+    records and then the new tokens, token t reads the state
+
+        diag(exp(G_t)) S + sum_{j < t} diag(exp(G_t - G_j)) k_j^T u_j.
+
+    exp(G_t - G_j) splits at the records' end E into exp(G_t - G_E) *
+    exp(G_E - G_j), both at most 1, so the decays fold into the new tokens'
+    k / q and the records' k; S, the bf16 shadow in shadow_ref, then enters
+    only through [k; q] @ S. Rows from num_tokens on are padding. Returns the
+    packed output [window, num_v_heads * v_head_dim] and the new records
+    [window, record_dim].
+    """
+    window = cfg.window_size
+    num_v_heads = cfg.num_v_heads
+    d_k = cfg.kq_head_dim
+    compute = cfg.dtypes.compute
+
+    token_row = jax.lax.broadcasted_iota(jnp.int32, (1, window, 1), 1)
+    is_token = token_row < num_tokens
+    q = jnp.where(is_token, q_chunked.astype(compute), 0)
+    k = jnp.where(is_token, k_chunked.astype(compute), 0)
+    v = jnp.where(is_token, v_chunked.astype(compute), 0)
+    b_rows = b_rows.astype(compute)
+    beta = b_rows if cfg.beta_is_activated else jax.nn.sigmoid(b_rows)
+    beta = jnp.where(is_token, beta, 0)
+    # Note (david): pad rows get log decay 0, a decay of 1, so they leave the
+    # cumulative decay of the rows after them unchanged.
+    g = jnp.where(
+        is_token,
+        log_decay(g_chunked.astype(compute), a_log.astype(compute),
+                  dt_bias.astype(compute), cfg.lower_bound), 0)
+
+    u_records, k_records, g_records = replay_record_parts(
+        records, num_records, cfg)
+
+    q = l2_norm(q) * d_k**-0.5
+    k = l2_norm(k)
+    beta_col = fused_transpose_broadcast(beta, src_dim=2,
+                                         dst_dim=0)[:num_v_heads]
+
+    g_records_cumsum = cumsum_rows(g_records)
+    g_records_total = g_records_cumsum[:, -1:]
+    g_new_cumsum = cumsum_rows(g)
+    decay_new = jnp.exp(g_new_cumsum)
+    k_records_decayed = (jnp.repeat(k_records, cfg.v_per_kq_head, axis=0) *
+                         jnp.exp(g_records_total - g_records_cumsum))
+
+    k_repeat = jnp.repeat(k, cfg.v_per_kq_head, axis=0)
+    q_repeat = jnp.repeat(q, cfg.v_per_kq_head, axis=0)
+    # Note (david): k and q rows share each head's weight push, of S here and
+    # of the records' k and u below.
+    kq_decayed = jnp.concatenate([k_repeat * decay_new, q_repeat * decay_new],
+                                 axis=1)
+
+    with profile_scope("replay_ckpt_read"):
+        # Note (david): a default-precision f32 dot rounds both operands to
+        # bf16 (round to nearest), so this dot on the bf16 shadow is bitwise
+        # the one on the f32 checkpoint (v6e).
+        ckpt_reads = batched_matmul(
+            (kq_decayed * jnp.exp(g_records_total)).astype(jnp.bfloat16),
+            shadow_ref[...])
+
+    with profile_scope("replay_record_read"):
+        record_coeffs = jax.lax.dot_general(
+            kq_decayed, k_records_decayed, (((2, ), (2, )), ((0, ), (0, ))),
+            preferred_element_type=jnp.float32)
+        record_reads = batched_matmul(record_coeffs, u_records)
+
+    reads = ckpt_reads + record_reads
+    residual = v - reads[:, :window]
+    q_reads = reads[:, window:]
+
+    with profile_scope("replay_tokens"):
+        if window == 1:
+            u = beta_col * residual
+            q_dot_k = jnp.sum(q_repeat * k_repeat, axis=-1, keepdims=True)
+            out = q_reads + q_dot_k * u
+        else:
+            # Note (david): the in-window decays exp(G_s - G_p) are formed
+            # pair by pair, each at most 1, since a split at a reference row
+            # could overflow one factor; at window <= 8 the pairs and the
+            # forward substitution are a few VPU broadcasts and lane sums.
+            u_rows = []
+            out_rows = []
+            for token in range(window):
+                k_token = k_repeat[:, token:token + 1]
+                q_token = q_repeat[:, token:token + 1]
+                u_token = (beta_col[:, token:token + 1] *
+                           residual[:, token:token + 1])
+                out_token = q_reads[:, token:token + 1]
+                for prev in range(token):
+                    decay_pair = jnp.exp(g_new_cumsum[:, token:token + 1] -
+                                         g_new_cumsum[:, prev:prev + 1])
+                    k_prev = k_repeat[:, prev:prev + 1] * decay_pair
+                    k_dot = jnp.sum(k_token * k_prev, axis=-1, keepdims=True)
+                    u_token = (u_token - beta_col[:, token:token + 1] * k_dot *
+                               u_rows[prev])
+                    q_dot = jnp.sum(q_token * k_prev, axis=-1, keepdims=True)
+                    out_token = out_token + q_dot * u_rows[prev]
+                q_dot_self = jnp.sum(q_token * k_token, axis=-1, keepdims=True)
+                u_rows.append(u_token)
+                out_rows.append(out_token + q_dot_self * u_token)
+            u = jnp.concatenate(u_rows, axis=1)
+            out = jnp.concatenate(out_rows, axis=1)
+
+    new_records = jnp.concatenate(
+        [u[head] for head in range(num_v_heads)] +
+        [k[head] for head in range(cfg.num_kq_heads)] +
+        [g[head] for head in range(num_v_heads)], axis=-1)
+
+    return pack_out(out, cfg), new_records
+
+
+def replay_flush(
+    records: jax.Array,
+    num_records: jax.Array,
+    checkpoint_ref: jax.Ref,
+    wait_checkpoint: Callable[[], None],
+    cfg: config.KDAConfig,
+) -> jax.Array:
+    """Fold one sequence's first num_records records into its f32 checkpoint
+    and return the new checkpoint.
+
+    wait_checkpoint runs right before checkpoint_ref is read, so the caller
+    can wait for its DMA there.
+    """
+    u_records, k_records, g_records = replay_record_parts(
+        records, num_records, cfg)
+    # Note (david): the fold is the only place record error enters the
+    # recurrence, and it runs once per flush, so it pays for f32 precision.
+    with profile_scope("replay_flush"):
+        g_records_cumsum = cumsum_rows(g_records)
+        g_records_total = g_records_cumsum[:, -1:]
+        k_records_decayed = (
+            jnp.repeat(k_records, cfg.v_per_kq_head, axis=0) *
+            jnp.exp(g_records_total - g_records_cumsum))
+        update = batched_matmul(jnp.swapaxes(k_records_decayed, 1, 2),
+                                u_records,
+                                precision=jax.lax.Precision.HIGHEST)
+        decay_total = fused_transpose_broadcast(
+            jnp.exp(g_records_total), src_dim=2, dst_dim=1)
+        wait_checkpoint()
+        return (checkpoint_ref[...].astype(cfg.dtypes.compute) * decay_total +
+                update)

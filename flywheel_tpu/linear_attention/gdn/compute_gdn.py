@@ -958,3 +958,209 @@ def recurrent_gdn(
         seq_states.append(window_states)
 
     return jnp.stack(seq_outs, axis=0), jnp.stack(seq_states, axis=0)
+
+
+def replay_record_parts(
+        records: jax.Array, num_records: jax.Array,
+        cfg: config.GDNConfig) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Split a [replay_window, record_dim] record buffer into u [num_v_heads,
+    rows, v_head_dim], k [num_kq_heads, rows, kq_head_dim] and g [1, rows,
+    gate_lanes]; rows from num_records on are zero."""
+    d_k, d_v = cfg.kq_head_dim, cfg.v_head_dim
+    gate_lanes = cfg.aligned_num_v_heads
+    # Note (david): rows past num_records may hold NaN from stale VMEM, so they
+    # are selected away, not scaled: 0 * NaN is NaN.
+    record_row = jax.lax.broadcasted_iota(jnp.int32, records.shape, 0)
+    records = jnp.where(record_row < num_records, records, 0)
+    u_records = jnp.stack([
+        records[:, head * d_v:(head + 1) * d_v]
+        for head in range(cfg.num_v_heads)
+    ])
+    k_records = jnp.stack([
+        records[:, cfg.record_k_offset + head * d_k:
+                cfg.record_k_offset + (head + 1) * d_k]
+        for head in range(cfg.num_kq_heads)
+    ])
+    g_records = records[None, :, cfg.record_g_offset:
+                        cfg.record_g_offset + gate_lanes]
+    return u_records, k_records, g_records
+
+
+def gate_column(row_layout: jax.Array, num_v_heads: int) -> jax.Array:
+    """[1, rows, gate_lanes] -> [num_v_heads, rows, 1]."""
+    return fused_transpose_broadcast(row_layout, src_dim=2,
+                                     dst_dim=0)[:num_v_heads]
+
+
+def gate_row(row_layout: jax.Array, num_v_heads: int) -> jax.Array:
+    """[1, rows, gate_lanes] -> [num_v_heads, 1, rows]."""
+    return jnp.transpose(row_layout[0])[:num_v_heads, None, :]
+
+
+def replay_gdn(
+    q_chunked: jax.Array,
+    k_chunked: jax.Array,
+    v_chunked: jax.Array,
+    b_rows: jax.Array,
+    a_rows: jax.Array,
+    num_tokens: jax.Array,
+    num_records: jax.Array,
+    records: jax.Array,
+    shadow_ref: jax.Ref,
+    a_log: jax.Array,
+    dt_bias: jax.Array,
+    cfg: config.GDNConfig,
+) -> tuple[jax.Array, jax.Array]:
+    """One ReplaySSM step of one sequence: outputs and new records, no state.
+
+    With G the cumulative log decay over the committed records and then the
+    new tokens, token t reads the state
+
+        exp(G_t) S + sum_{j < t} exp(G_t - G_j) k_j^T u_j,
+
+    so S, the bf16 shadow in shadow_ref, enters only through [k; q] @ S and
+    the records only through dots with their k and u. Rows from num_tokens on
+    are padding. Returns the packed output [window, num_v_heads * v_head_dim]
+    and the new records [window, record_dim].
+    """
+    window = cfg.window_size
+    num_v_heads = cfg.num_v_heads
+    d_k = cfg.kq_head_dim
+    compute = cfg.dtypes.compute
+
+    token_row = jax.lax.broadcasted_iota(jnp.int32, (1, window, 1), 1)
+    is_token = token_row < num_tokens
+    q = jnp.where(is_token, q_chunked.astype(compute), 0)
+    k = jnp.where(is_token, k_chunked.astype(compute), 0)
+    v = jnp.where(is_token, v_chunked.astype(compute), 0)
+    beta = jnp.where(is_token, jax.nn.sigmoid(b_rows.astype(compute)), 0)
+    # Note (david): pad rows get log decay 0, a decay of 1, so they leave the
+    # cumulative decay of the rows after them unchanged.
+    g = jnp.where(
+        is_token,
+        -jnp.exp(a_log) * jax.nn.softplus(a_rows.astype(compute) + dt_bias),
+        0)
+
+    u_records, k_records, g_records = replay_record_parts(
+        records, num_records, cfg)
+
+    q = l2_norm(q) * d_k**-0.5
+    k = l2_norm(k)
+
+    # Note (david): every decay below is exp of a non-positive log decay, so
+    # none can overflow.
+    g_records_cumsum = cumsum_rows(g_records)
+    g_records_total = g_records_cumsum[:, -1:]
+    g_new_cumsum = cumsum_rows(g)
+    decay_records_to_end = gate_row(
+        jnp.exp(g_records_total - g_records_cumsum), num_v_heads)
+    decay_new_col = gate_column(jnp.exp(g_new_cumsum), num_v_heads)
+    decay_ckpt_col = gate_column(jnp.exp(g_records_total + g_new_cumsum),
+                                 num_v_heads)
+    beta_col = gate_column(beta, num_v_heads)
+
+    k_repeat = jnp.repeat(k, cfg.v_per_kq_head, axis=0)
+    q_repeat = jnp.repeat(q, cfg.v_per_kq_head, axis=0)
+    # Note (david): k and q rows share each head's weight push, of S here and
+    # of the records' u below.
+    kq = jnp.concatenate([k, q], axis=1)
+    kq_repeat = jnp.concatenate([k_repeat, q_repeat], axis=1)
+
+    with profile_scope("replay_ckpt_read"):
+        ckpt_scale = jnp.concatenate([decay_ckpt_col, decay_ckpt_col], axis=1)
+        # Note (david): a default-precision f32 dot rounds both operands to
+        # bf16 (round to nearest), so this dot on the bf16 shadow is bitwise
+        # the one on the f32 checkpoint (v6e).
+        ckpt_reads = batched_matmul(
+            (kq_repeat * ckpt_scale).astype(jnp.bfloat16), shadow_ref[...])
+
+    with profile_scope("replay_record_read"):
+        kq_dot_records = jax.lax.dot_general(
+            kq, k_records, (((2, ), (2, )), ((0, ), (0, ))),
+            preferred_element_type=jnp.float32)
+        record_scale = jnp.concatenate([decay_new_col, decay_new_col], axis=1)
+        record_coeffs = (jnp.repeat(kq_dot_records, cfg.v_per_kq_head, axis=0)
+                         * record_scale * decay_records_to_end)
+        record_reads = batched_matmul(record_coeffs, u_records)
+
+    reads = ckpt_reads + record_reads
+    residual = v - reads[:, :window]
+    q_reads = reads[:, window:]
+
+    with profile_scope("replay_tokens"):
+        if window == 1:
+            u = beta_col * residual
+            q_dot_k = jnp.sum(q_repeat * k_repeat, axis=-1, keepdims=True)
+            out = q_reads + q_dot_k * u
+        else:
+            # Note (david): at window <= 8, forward substitution of the
+            # window's unit lower triangular system is a few VPU broadcasts
+            # per row.
+            kq_dot_k = jax.lax.dot_general(
+                kq, k, (((2, ), (2, )), ((0, ), (0, ))),
+                preferred_element_type=jnp.float32)
+            kq_dot_k = jnp.repeat(kq_dot_k, cfg.v_per_kq_head, axis=0)
+            pair_shape = (1, window, window)
+            row = jax.lax.broadcasted_iota(jnp.int32, pair_shape, 1)
+            col = jax.lax.broadcasted_iota(jnp.int32, pair_shape, 2)
+            is_lower = row >= col
+            log_decay_pair = jnp.where(
+                is_lower,
+                gate_column(g_new_cumsum, num_v_heads) -
+                gate_row(g_new_cumsum, num_v_heads), 0)
+            decay_pair = jnp.where(is_lower, jnp.exp(log_decay_pair), 0)
+            akk = jnp.where(row > col,
+                            beta_col * kq_dot_k[:, :window] * decay_pair, 0)
+            aqk = kq_dot_k[:, window:] * decay_pair
+            u_rows = []
+            for token in range(window):
+                u_token = (beta_col[:, token:token + 1] *
+                           residual[:, token:token + 1])
+                for prev in range(token):
+                    u_token = (u_token - akk[:, token:token + 1,
+                                             prev:prev + 1] * u_rows[prev])
+                u_rows.append(u_token)
+            u = jnp.concatenate(u_rows, axis=1)
+            out = q_reads
+            for prev in range(window):
+                out = out + aqk[:, :, prev:prev + 1] * u_rows[prev]
+
+    new_records = jnp.concatenate(
+        [u[head] for head in range(num_v_heads)] +
+        [k[head] for head in range(cfg.num_kq_heads)] + [g[0]], axis=-1)
+
+    return pack_out(out, cfg), new_records
+
+
+def replay_flush(
+    records: jax.Array,
+    num_records: jax.Array,
+    checkpoint_ref: jax.Ref,
+    wait_checkpoint: Callable[[], None],
+    cfg: config.GDNConfig,
+) -> jax.Array:
+    """Fold one sequence's first num_records records into its f32 checkpoint
+    and return the new checkpoint.
+
+    wait_checkpoint runs right before checkpoint_ref is read, so the caller
+    can wait for its DMA there.
+    """
+    num_v_heads = cfg.num_v_heads
+    u_records, k_records, g_records = replay_record_parts(
+        records, num_records, cfg)
+    # Note (david): the fold is the only place record error enters the
+    # recurrence, and it runs once per flush, so it pays for f32 precision.
+    with profile_scope("replay_flush"):
+        g_records_cumsum = cumsum_rows(g_records)
+        g_records_total = g_records_cumsum[:, -1:]
+        decay_records_to_end = gate_row(
+            jnp.exp(g_records_total - g_records_cumsum), num_v_heads)
+        k_records_t = jnp.repeat(jnp.swapaxes(k_records, 1, 2),
+                                 cfg.v_per_kq_head, axis=0)
+        update = batched_matmul(k_records_t * decay_records_to_end,
+                                u_records,
+                                precision=jax.lax.Precision.HIGHEST)
+        decay_total = gate_column(jnp.exp(g_records_total), num_v_heads)
+        wait_checkpoint()
+        return (checkpoint_ref[...].astype(cfg.dtypes.compute) * decay_total +
+                update)
