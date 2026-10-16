@@ -97,10 +97,11 @@ def default_block(
   """Analytic physical block for a sequence axis, shared by fwd and bwd.
 
   seqlen <= candidates[0] is one whole-axis block; a longer axis takes the
-  largest candidate dividing it. max_seqlen (packed schedules only) caps the
-  block at max(candidates[-1], next_pow2(max_seqlen)), relaxed to the largest
-  candidate under the cap that divides the axis, since a block spanning several
-  sequences leaves the block-diagonal schedule nothing to skip.
+  largest candidate dividing it. max_seqlen (packed schedules, or a window's
+  block cap) caps the block at max(candidates[-1], next_pow2(max_seqlen)),
+  relaxed to the largest candidate under the cap that divides the axis, since
+  a block spanning several sequences leaves the block-diagonal schedule
+  nothing to skip.
   """
   if seqlen <= candidates[0]:
     block = seqlen

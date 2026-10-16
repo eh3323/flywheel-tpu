@@ -28,6 +28,14 @@ from flywheel_tpu.pallas.flash_fwd_varlen_paged import (
 INTERPRET = jax.default_backend() != "tpu"
 OUT_TOL = dict(rtol=2e-2, atol=3e-2)
 LSE_TOL = dict(rtol=2e-3, atol=4e-3)
+# Note (david): random q and k give scaled scores of std 1, which a softcap of 5
+# barely bends; a softmax_scale of SOFTCAP_SCORE_GAIN / sqrt(head_dim) spreads
+# them into the cap's curved range.
+SOFTCAP_SCORE_GAIN = 4.0
+
+
+def bf16(array):
+  return jnp.asarray(array, jnp.bfloat16)
 
 
 def random_ragged_case(lengths=(3, 0, 5), prefixes=(127, 0, 251), heads=4,
@@ -54,8 +62,13 @@ def random_ragged_case(lengths=(3, 0, 5), prefixes=(127, 0, 251), heads=4,
 
 
 def ragged_reference(q, kc, vc, k, v, cu, lengths, table, *, causal,
-                     num_active=None, softmax_scale=None):
+                     num_active=None, softmax_scale=None, window_left=None,
+                     softcap=0.0):
   """Appends k/v to the paged caches, then attends each request's rows.
+
+  window_left hides the keys more than window_left positions before a row's
+  bottom-right diagonal; softcap > 0 maps each scaled score s to
+  softcap * tanh(s / softcap) before masking.
 
   Returns (out, lse, k_pages, v_pages, top2), where top2 is the attention mass
   on the two heaviest keys of every attending (row, head).
@@ -96,11 +109,20 @@ def ragged_reference(q, kc, vc, k, v, cu, lengths, table, *, causal,
       rows = np.arange(chunk_start, min(chunk_start + 256, query_length))
       queries = q[start + rows].reshape(
           len(rows), kv_heads, repeats, 1, head_dim)
-      scores = (queries @ keys)[..., 0, :] * scale
-      if causal:
-        visible = positions[None] <= (total - query_length + rows)[:, None]
+      raw_scores = (queries @ keys)[..., 0, :] * scale
+      if softcap:
+        scores = softcap * np.tanh(raw_scores / softcap)
       else:
-        visible = np.ones((len(rows), total), bool)
+        scores = raw_scores
+      diagonal = (total - query_length + rows)[:, None]
+      if causal:
+        right_visible = positions[None] <= diagonal
+      else:
+        right_visible = np.ones((len(rows), total), bool)
+      if window_left is None:
+        visible = right_visible
+      else:
+        visible = right_visible & (positions[None] >= diagonal - window_left)
       seen = visible.any(axis=-1)
       scores = np.where(visible[:, None, None], scores, -np.inf)
       anchor = np.where(seen[:, None, None, None],
@@ -232,11 +254,14 @@ def test_ragged_cache_matches_reference(causal, append):
   assert_extend_matches(actual, expected, cu, lengths, len(lengths))
 
 
-@pytest.mark.parametrize("interleaved,causal,append", [
-    (True, True, True), (False, False, False)])
-def test_ragged_cache_rotary_q_matches_reference(interleaved, causal, append):
+@pytest.mark.parametrize("interleaved,causal,append,window_size,softcap", [
+    (True, True, True, (-1, -1), 0.0), (False, False, False, (-1, -1), 0.0),
+    (True, True, True, (100, 0), 5.0), (False, False, True, (60, -1), 5.0)])
+def test_ragged_cache_rotary_q_matches_reference(interleaved, causal, append,
+                                                 window_size, softcap):
   # Note (david): the paged cache holds K already rotated, so only Q turns, at
-  # its bottom-right position seqused_k - q_len + t.
+  # its bottom-right position seqused_k - q_len + t. The window and softcap
+  # act on the rotated scores.
   q, kc, vc, k, v, cu, lengths, table = random_ragged_case()
   k, v = (k, v) if append else (None, None)
   head_dim = q.shape[-1]
@@ -260,12 +285,18 @@ def test_ragged_cache_rotary_q_matches_reference(interleaved, causal, append):
     second = reference_q[start:end, :, second_lanes]
     reference_q[start:end, :, first_lanes] = first * cosine - second * sine
     reference_q[start:end, :, second_lanes] = first * sine + second * cosine
-  expected = ragged_reference(reference_q, kc, vc, k, v, cu, lengths, table,
-                              causal=causal)
+  scale = SOFTCAP_SCORE_GAIN / math.sqrt(head_dim) if softcap else None
+  expected = ragged_reference(
+      reference_q, kc, vc, k, v, cu, lengths, table,
+      causal=causal or window_size[1] == 0, softmax_scale=scale,
+      window_left=None if window_size[0] == -1 else window_size[0],
+      softcap=softcap)
   actual = run_paged(q, kc, vc, k, v, cu, lengths, table,
                      causal=causal, rotary_cos=jnp.asarray(cos),
                      rotary_sin=jnp.asarray(sin),
-                     rotary_interleaved=interleaved, rotary_k=False)
+                     rotary_interleaved=interleaved, rotary_k=False,
+                     window_size=window_size, softcap=softcap,
+                     softmax_scale=scale)
   assert_extend_matches(actual, expected, cu, lengths, len(lengths))
 
 
@@ -282,6 +313,47 @@ def test_ragged_cache_multiple_query_blocks_and_pages(head_dim, heads,
   expected = ragged_reference(*case, causal=True)
   actual = run_paged(*case, causal=True, max_seqlen_q=128, max_seqlen_k=128)
   assert_extend_matches(actual, expected, case[5], case[6], 2)
+
+
+# Note (david): the narrowest window keeps 6 keys, because a one-key row's lse
+# is a single bf16-rounded dot product, whose error passes the lse tolerance.
+PAGED_WINDOW_SOFTCAP_CASES = [
+    (4, 2, True, True, (127, 0), 0.0),
+    (8, 2, True, True, (300, 0), 0.0),
+    (4, 4, True, False, (5, 0), 0.0),
+    (8, 1, False, True, (40, -1), 0.0),
+    (4, 2, False, False, (-1, 0), 5.0),
+    (8, 2, True, True, (-1, -1), 5.0),
+    (8, 1, True, True, (100, 0), 5.0),
+]
+
+
+@pytest.mark.parametrize("entry", ["varlen", "kvcache"])
+@pytest.mark.parametrize("heads,kv_heads,causal,append,window_size,softcap",
+                         PAGED_WINDOW_SOFTCAP_CASES)
+def test_paged_window_and_softcap_match_reference(
+    entry, heads, kv_heads, causal, append, window_size, softcap):
+  # Note (david): on the varlen entry, 128-token bounds cap both blocks at one
+  # page, so the 131-row request spans two q blocks whose windows start
+  # several kv blocks in; flash_attn_with_kvcache picks its own blocks.
+  q, kc, vc, k, v, cu, lengths, table = random_ragged_case(
+      lengths=(131, 17), prefixes=(400, 255), heads=heads, kv_heads=kv_heads,
+      capacity=640, padding=3)
+  k, v = (k, v) if append else (None, None)
+  scale = SOFTCAP_SCORE_GAIN / math.sqrt(q.shape[-1]) if softcap else None
+  expected = ragged_reference(
+      q, kc, vc, k, v, cu, lengths, table,
+      causal=causal or window_size[1] == 0, softmax_scale=scale,
+      window_left=None if window_size[0] == -1 else window_size[0],
+      softcap=softcap)
+  kwargs = dict(causal=causal, window_size=window_size, softcap=softcap,
+                softmax_scale=scale)
+  if entry == "varlen":
+    actual = run_paged(q, kc, vc, k, v, cu, lengths, table, max_seqlen_q=128,
+                       max_seqlen_k=128, **kwargs)
+  else:
+    actual = run_extend(q, kc, vc, k, v, cu, lengths, table, **kwargs)
+  assert_extend_matches(actual, expected, cu, lengths, 2)
 
 
 @pytest.mark.parametrize("heads,kv_heads,head_dim", [
@@ -532,8 +604,8 @@ def test_ragged_cache_has_no_pool_sized_temporary():
     ("cu_seqlens_k_with_block_table", ValueError, "cu_seqlens_k"),
     ("token_major", NotImplementedError, "(?i)token.major"),
     ("rotary_k", NotImplementedError, "rotary_k"),
-    ("window_size", NotImplementedError, "window"),
-    ("softcap", NotImplementedError, "softcap"),
+    ("window_right_bound", NotImplementedError, "right bound"),
+    ("negative_softcap", ValueError, "softcap"),
     ("cu_seqlens_q_start", ValueError, "cu_seqlens_q"),
     ("num_active_past_batch", ValueError, "num_active"),
     ("num_active_jax_negative", ValueError, "num_active"),
@@ -567,10 +639,10 @@ def test_paged_varlen_rejects_unsupported_calls(case, error, message):
   elif case == "rotary_k":
     rope_table = jnp.ones((128, head_dim // 2), jnp.float32)
     kwargs.update(rotary_cos=rope_table, rotary_sin=rope_table, rotary_k=True)
-  elif case == "window_size":
-    kwargs["window_size"] = (16, 0)
-  elif case == "softcap":
-    kwargs["softcap"] = 5.0
+  elif case == "window_right_bound":
+    kwargs.update(causal=False, window_size=(16, 4))
+  elif case == "negative_softcap":
+    kwargs["softcap"] = -1.0
   elif case == "cu_seqlens_q_start":
     operands[3] = jnp.array([2, 3, total_q], jnp.int32)
   elif case == "num_active_past_batch":
@@ -592,14 +664,23 @@ def test_paged_varlen_rejects_unsupported_calls(case, error, message):
     flash_attn_varlen_func(*operands, total_q, 128, **kwargs)
 
 
+def test_multitoken_rejects_window_right_bound():
+  # Note (david): the paged kernel bounds the right edge only at the causal
+  # diagonal, so a non-causal right bound past it must raise, not be dropped.
+  q, kc, vc, k, v, cu, lengths, table = random_ragged_case()
+  with pytest.raises(NotImplementedError, match="right bound"):
+    run_extend(q, kc, vc, k, v, cu, lengths, table, causal=False,
+               window_size=(16, 4))
+
+
 def paged_tiles(max_seqlen_q_bucket, max_seqlen_k_bucket, *, head_dim=128,
-                page_size=128, gqa_fold=1, block_sizes=None):
+                page_size=128, gqa_fold=1, has_window=False, block_sizes=None):
   """resolve_paged_tiles with no lse or rotary."""
   return resolve_paged_tiles(
       max_seqlen_q_bucket=max_seqlen_q_bucket,
       max_seqlen_k_bucket=max_seqlen_k_bucket, page_size=page_size,
       head_dim=head_dim, return_lse=False, rotary_dtype=None,
-      gqa_fold=gqa_fold, block_sizes=block_sizes)
+      gqa_fold=gqa_fold, has_window=has_window, block_sizes=block_sizes)
 
 
 @pytest.mark.parametrize("shape,dtype,expected_bytes", [
@@ -731,6 +812,22 @@ def test_paged_tiles_fold_q_heads_into_fragment_rows(
       gqa_fold=gqa_fold) <= vmem_limit_bytes()
 
 
+@pytest.mark.parametrize(
+    "max_seqlen_q_bucket,page_size,gqa_fold,head_dim,expected", [
+        (1024, 128, 1, 128, (512, 512, 256, 512)),
+        (1024, 128, 8, 256, (512, 512, 128, 512)),
+        (1024, 256, 1, 128, (512, 512, 256, 512)),
+        (64, 128, 1, 128, (128, 512, 64, 512)),
+        (1024, 384, 1, 128, (512, 384, 256, 384)),
+    ])
+def test_paged_tiles_cap_window_blocks(max_seqlen_q_bucket, page_size, gqa_fold,
+                                       head_dim, expected):
+  blocks = paged_tiles(max_seqlen_q_bucket, 16384, head_dim=head_dim,
+                       page_size=page_size, gqa_fold=gqa_fold, has_window=True)
+  assert (blocks.block_q, blocks.block_kv, blocks.block_q_compute,
+          blocks.block_kv_compute) == expected
+
+
 def test_paged_tiles_reject_pinned_vmem_overflow():
   # Note (david): a pinned build past the budget raises; nothing shrinks
   # behind the pin. A 65536-token kv block stages ~200 MiB at d256.
@@ -750,7 +847,7 @@ def test_paged_tiles_reject_pinned_vmem_overflow():
 def probe_case(lengths, prefixes, *, heads=4, kv_heads=2, head_dim=128,
                page_size=128, pages_per_seq=None, padding=0, batch=None,
                tail_owned=False, unused_pages=None, causal=True, logit=12.0,
-               softmax_scale=None, seed=7):
+               softmax_scale=None, window_left=None, seed=7):
   """Needle-probe inputs in random_ragged_case's tuple layout.
 
   lengths/prefixes describe the active requests (num_active = len(lengths)).
@@ -761,7 +858,9 @@ def probe_case(lengths, prefixes, *, heads=4, kv_heads=2, head_dim=128,
   at the row itself, the row before it or a recent row, plus the first hidden
   key (causal) or a random request row (not causal). Odd heads aim at a
   visible position, half the time one next to a page, 256/512/1024/2048-token
-  or 128-row chunk edge.
+  or 128-row chunk edge. window_left keeps every target inside the row's
+  window, and half the rows of each head aim at its first visible key plus
+  the last hidden one instead.
   """
   rng = np.random.default_rng(seed)
   active = len(lengths)
@@ -844,12 +943,20 @@ def probe_case(lengths, prefixes, *, heads=4, kv_heads=2, head_dim=128,
                           edges[rng.integers(0, count)],
                           rng.integers(0, last + 1))
         second = np.full(length, -1)
-      direction = codes[seq][target, group[head]] + np.where(
-          second[:, None] >= 0, codes[seq][second, group[head]], 0)
+      if window_left is None:
+        aimed_target, aimed_second = target, second
+      else:
+        # Note (david): a missed left edge splits the attention of an edge row
+        # onto the hidden key it also aims at.
+        first_visible = np.maximum(rows - window_left, 0)
+        at_edge = rng.random(length) < 0.5
+        aimed_target = np.where(at_edge, first_visible,
+                                np.maximum(target, first_visible))
+        aimed_second = np.where(at_edge & (first_visible > 0),
+                                first_visible - 1, second)
+      direction = codes[seq][aimed_target, group[head]] + np.where(
+          aimed_second[:, None] >= 0, codes[seq][aimed_second, group[head]], 0)
       q[start:start + length, head] = logit / scale * direction
-
-  def bf16(array):
-    return jnp.asarray(array, jnp.bfloat16)
 
   return (bf16(q), bf16(kc), bf16(vc), bf16(k), bf16(v),
           jnp.asarray(cu, jnp.int32), jnp.asarray(cache_seqlens, jnp.int32),
@@ -894,6 +1001,37 @@ def test_paged_chunked_prefill_long_prefix(lengths, prefixes, page_size,
   expected = ragged_reference(*case, causal=causal)
   assert_probe_is_sharp(expected[4])
   actual = run_paged(*case, causal=causal, max_seqlen_q=256)
+  assert_extend_matches(actual, expected, case[5], case[6], len(lengths))
+
+
+@pytest.mark.parametrize("entry", ["varlen", "kvcache"])
+@pytest.mark.parametrize(
+    "lengths,prefixes,heads,kv_heads,causal,window_left,softcap", [
+        ((700, 300), (1500, 2900), 8, 2, True, 255, 0.0),
+        ((700, 300), (1500, 2900), 8, 2, True, 1000, 30.0),
+        ((300, 700), (2900, 1500), 4, 2, False, 511, 0.0),
+        ((96, 45, 20), (2000, 1023, 500), 32, 8, True, 127, 50.0),
+    ])
+def test_paged_window_edges_long_prefix(entry, lengths, prefixes, heads,
+                                        kv_heads, causal, window_left,
+                                        softcap):
+  # Note (david): the windows are shorter than the chunks, so each q block
+  # starts its kv interval past the prefix's first blocks, and the left edge
+  # crosses page and kv block edges row by row. On the varlen entry
+  # max_seqlen_q = 256 splits every chunk over several q blocks. A softcap of
+  # 30 or 50 bends a 16-nat needle by over a nat, which the lse check sees.
+  case = probe_case(lengths, prefixes, heads=heads, kv_heads=kv_heads,
+                    padding=13, causal=causal, window_left=window_left,
+                    logit=16.0)
+  expected = ragged_reference(*case, causal=causal, window_left=window_left,
+                              softcap=softcap)
+  assert_probe_is_sharp(expected[4])
+  kwargs = dict(causal=causal, window_size=(window_left, 0 if causal else -1),
+                softcap=softcap)
+  if entry == "varlen":
+    actual = run_paged(*case, max_seqlen_q=256, **kwargs)
+  else:
+    actual = run_extend(*case, **kwargs)
   assert_extend_matches(actual, expected, case[5], case[6], len(lengths))
 
 
@@ -985,13 +1123,39 @@ def test_paged_overflow_guard_checks_last_live_kv_tile():
       (length, kv_heads, head_dim))
   pages = np.zeros((num_pages, page_size, kv_heads, head_dim))
 
-  def bf16(array):
-    return jnp.asarray(array, jnp.bfloat16)
-
   case = (bf16(q), bf16(pages), bf16(pages), bf16(k), bf16(v),
           jnp.array([0, length], jnp.int32), jnp.array([0], jnp.int32),
           jnp.arange(num_pages, dtype=jnp.int32)[None])
   expected = ragged_reference(*case, causal=True)
   actual = run_paged(*case, causal=True, max_seqlen_k=num_pages * page_size)
   assert np.all(np.isfinite(np.asarray(actual[0], np.float32)))
+  assert_extend_matches(actual, expected, case[5], case[6], 1)
+
+
+def test_paged_replay_rescale_survives_skipped_fragment():
+  # Note (david): keys [0, 256) score 0 and keys [256, 1024) ~200 nats, so
+  # every row past 256 overflows its first-tile anchor and the block replays.
+  # With 512-row q tiles and 256-key kv tiles, q tile 0's frontier skips kv
+  # tiles 2 and 3, so q tile 1's fragments at kv tiles 1 and 2 run back to
+  # back in the replay. The rebase at kv tile 1 must still scale away the
+  # first tile's state, whatever kv tile 2's softmax computes next.
+  length, heads, head_dim = 1024, 1, 128
+  num_pages, page_size = 8, 128
+  scale = 1 / math.sqrt(head_dim)
+  direction = np.zeros(head_dim)
+  direction[0] = 1.0
+  magnitude = math.sqrt(200.0 / scale)
+  q = np.broadcast_to(magnitude * direction, (length, heads, head_dim))
+  k = np.zeros((length, heads, head_dim))
+  k[256:] = magnitude * direction
+  v = np.where(np.arange(length)[:, None, None] < 256, 1.0, 3.0) * np.ones(
+      (length, heads, head_dim))
+  pages = np.zeros((num_pages, page_size, heads, head_dim))
+
+  case = (bf16(q), bf16(pages), bf16(pages), bf16(k), bf16(v),
+          jnp.array([0, length], jnp.int32), jnp.array([0], jnp.int32),
+          jnp.arange(num_pages, dtype=jnp.int32)[None])
+  expected = ragged_reference(*case, causal=True)
+  actual = run_paged(*case, causal=True, max_seqlen_k=num_pages * page_size,
+                     block_sizes=(1024, 1024, 512, 256))
   assert_extend_matches(actual, expected, case[5], case[6], 1)

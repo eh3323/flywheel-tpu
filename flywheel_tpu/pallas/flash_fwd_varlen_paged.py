@@ -18,6 +18,7 @@ from .block_sizes import (
   F32_BYTES,
   FWD_BLOCKS,
   FWD_KV_COMPUTE_BLOCKS,
+  LOG2E,
   NUM_LANES,
   NUM_SUBLANES,
   BlockSizes,
@@ -63,6 +64,11 @@ MAX_FRAGMENT_ROWS = 1024
 # 32:4 a 512 x 1024 block of 8 folded heads ran 32.3 against 9.14 ms at
 # 512 x 512.
 MAX_PAGED_BLOCK_AREA = 2048 * 1024
+# Note (david): a sliding window caps both blocks, as WINDOW_BLOCK does on the
+# dense entries. On v6e chunked prefill (d256, W 1024 and 4096), 512 beat 256
+# by 1.4-2.7x and uncapped blocks by up to 1.55x. 1024 saved 26% at 32:32 W
+# 4096 but cost 13% at W 1024, so the cap stays at 512.
+PAGED_WINDOW_BLOCK = 512
 
 
 def flash_fwd_varlen_paged_kernel(
@@ -75,6 +81,7 @@ def flash_fwd_varlen_paged_kernel(
     *refs: jax.Array,
     paged: PagedKVInfo,
     causal: bool,
+    window_left: int | None,
     num_head_groups: int,
     q_heads_per_kv_head: int,
     bq: int,
@@ -88,7 +95,8 @@ def flash_fwd_varlen_paged_kernel(
       padded_total_q=q_hbm.shape[1],
       bq=bq, bkv=bkv,
       page_size=paged.page_size, pages_per_seq=paged.pages_per_seq,
-      causal=causal, num_rows=cu_qblk_ref[cu_qblk_ref.shape[0] - 1],
+      causal=causal, left=window_left,
+      num_rows=cu_qblk_ref[cu_qblk_ref.shape[0] - 1],
   )
   # Note (david): K and V share the one merged cache operand.
   fwd_body(schedule, q_hbm, kv_hbm, kv_hbm, refs, bq=bq, bkv=bkv, paged=paged,
@@ -124,7 +132,7 @@ def paged_scratch_shapes(
   """(shape, dtype) of each VMEM scratch buffer forward_common allocates for
   one paged build, in its order: Q stage, (K, V) pair staging, K and V planes,
   bounds rows, Q rotary coefficients, out stage, row max, row sum, f32
-  accumulator, rescale, lse."""
+  accumulator, lse."""
   bq, bkv = block_sizes.block_q, block_sizes.block_kv
   num_stages = block_sizes.num_stages
   bf16, f32 = jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)
@@ -154,7 +162,6 @@ def paged_scratch_shapes(
       ((group_bq, NUM_LANES), f32),
       ((2, group_bq, NUM_LANES), f32),
       ((2, group_bq, head_dim), f32),
-      ((group_bq, NUM_LANES), f32),
       *lse_shapes,
   ]
 
@@ -190,6 +197,7 @@ def resolve_paged_tiles(
     return_lse: bool,
     rotary_dtype: jnp.dtype | None,
     gqa_fold: int,
+    has_window: bool,
     block_sizes: BlockSizes | None = None,
 ) -> BlockSizes:
   """block_sizes of one paged build, whose q sizes count tokens per head.
@@ -198,16 +206,18 @@ def resolve_paged_tiles(
   (gqa_fold * q) x kv block area is at most MAX_PAGED_BLOCK_AREA, picks the
   one that streams the longest sequence's kv prefix the fewest times, then the
   smaller q block, then the larger kv block. The q compute tile keeps a
-  fragment within MAX_FRAGMENT_ROWS rows. A pinned block_sizes is only checked
-  against the budget.
+  fragment within MAX_FRAGMENT_ROWS rows. has_window caps both blocks at
+  PAGED_WINDOW_BLOCK tokens, and block_kv at no less than one page. A pinned
+  block_sizes is only checked against the budget.
   """
   if block_sizes is not None:
     candidate_blocks = [block_sizes]
   else:
+    block_cap = PAGED_WINDOW_BLOCK if has_window else FWD_BLOCKS[0]
     # Note (david): block_kv is whole pages, so a 384- or 640-token page takes
     # five or three pages (1920 tokens), where no power-of-two block ends on a
     # page edge; smaller kv blocks halve the page count.
-    kv_block_cap = max(min(max_seqlen_k_bucket, FWD_BLOCKS[0]), page_size)
+    kv_block_cap = max(min(max_seqlen_k_bucket, block_cap), page_size)
     max_kv_pages = kv_block_cap // page_size
     kv_blocks = [page_size * (max_kv_pages >> shift)
                  for shift in range(max_kv_pages.bit_length())]
@@ -219,7 +229,7 @@ def resolve_paged_tiles(
     min_kv_block = min(FWD_KV_COMPUTE_BLOCKS[0], kv_blocks[0])
     kv_blocks = [block_kv for block_kv in kv_blocks
                  if block_kv >= min_kv_block]
-    q_block_cap = max(max_seqlen_q_bucket, FWD_BLOCKS[-1])
+    q_block_cap = min(max(max_seqlen_q_bucket, FWD_BLOCKS[-1]), block_cap)
     # Note (david): FWD_BLOCKS are powers of two, so the smaller of two powers
     # of two divides the q block; a folded tile stays whole bf16 tiles.
     head_tile_rows = MAX_FRAGMENT_ROWS // gqa_fold
@@ -279,6 +289,8 @@ def flash_attn_varlen_paged(
     block_sizes: BlockSizes | None = None,
     rotary: tuple[jax.Array, None] | None = None,
     rotary_interleaved: bool = True,
+    window_left: int | None = None,
+    softcap: float = 0.0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
   """Packed head-major attention over a paged KV cache, read-only.
 
@@ -288,7 +300,10 @@ def flash_attn_varlen_paged(
   [k0, v0, k1, v1, ...]. seqused_k is each sequence's kv length with its new
   tokens, which the cache must already hold; block_table entries past those
   tokens' pages are never dereferenced. Causal rows align to the end of their
-  sequence's keys, and q_scale is softmax_scale * log2(e). Rows past
+  sequence's keys; window_left (None unbounded) also hides the keys more than
+  window_left positions before that diagonal. softcap > 0 applies Gemma-2's
+  tanh(s / softcap) * softcap to the scaled scores. q_scale is softmax_scale *
+  log2(e), or softmax_scale / softcap with a softcap. Rows past
   cu_seqlens_q[-1] are out = 0, lse = -inf. max_seqlen_q and max_seqlen_k
   only pick the tiles, so an underestimate is slow, not wrong.
   rotary is prepare_rotary's (q coefficients, None) pair.
@@ -373,6 +388,7 @@ def flash_attn_varlen_paged(
       return_lse=return_lse,
       rotary_dtype=rotary_dtype,
       gqa_fold=gqa_fold,
+      has_window=window_left is not None,
       block_sizes=block_sizes,
   )
   bq = block_sizes.block_q
@@ -410,6 +426,7 @@ def flash_attn_varlen_paged(
   kernel = partial(
       flash_fwd_varlen_paged_kernel,
       causal=causal,
+      window_left=window_left,
       num_head_groups=num_kv_heads,
       q_heads_per_kv_head=gqa_fold,
   )
@@ -431,7 +448,9 @@ def flash_attn_varlen_paged(
       guard_threshold=overflow_guard_threshold(capacity),
       window=(None, None),
       causal_offset=0,
-      softcap=0.0,
+      # Note (david): as in make_flash_attn_mha, Q carries softmax_scale /
+      # softcap, so log2(e) rides in the tanh output scale.
+      softcap=softcap * LOG2E,
       q_scale=q_scale,
   )
   if return_lse:

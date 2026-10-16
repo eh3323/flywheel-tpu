@@ -22,6 +22,7 @@ from flywheel_tpu.pallas.loop_schedule import (
     make_paged_fwd_schedule,
     make_per_seq_fwd_schedule,
     per_seq_qblk_prefix,
+    window_fragment_plans,
 )
 
 # The per-seq windows sit on the bf16 HBM tile of the chip the tests run on: 8
@@ -118,6 +119,70 @@ def test_dense_fwd_schedule_matches_the_mask(case):
       seqlen_q=seq_q, seqlen_kv=seq_kv, bq=bq, bkv=bkv,
       left=left, right=right, offset=offset)
   assert replay_dense_fwd(params, fold) == expected
+
+
+FRAGMENT_PLAN_CASES = [
+    # (seq_q, seq_kv, bq, bkv, bq_compute, bkv_compute, left, right, offset)
+    (2048, 2048, 512, 512, 256, 128, None, 0, 0),
+    (2048, 2048, 1024, 512, 256, 256, None, 0, 0),
+    (1024, 2048, 512, 512, 128, 256, None, 0, 1024),
+    (1536, 2048, 512, 512, 128, 128, None, 0, 512),
+    (2048, 2048, 512, 512, 128, 128, 300, 0, 0),
+    (2048, 2048, 512, 256, 128, 128, 700, 0, 0),
+    (2048, 2048, 512, 512, 256, 256, 1500, 0, 0),
+    (2048, 2048, 512, 512, 128, 128, 300, None, 0),
+    (2048, 2048, 512, 512, 128, 128, None, 100, 0),
+    (2048, 2048, 512, 512, 128, 128, 200, 50, 0),
+]
+
+
+@pytest.mark.parametrize("case", FRAGMENT_PLAN_CASES)
+def test_window_fragment_plans_cover_the_dense_schedule(case):
+  # Note (david): fwd_body runs a partial block only through the plan of its
+  # offset, so a missing offset or fragment would drop work silently, and a
+  # q tile must keep its tile 0 in every block after its row starts to carry
+  # the row state across the parity flip.
+  seq_q, seq_kv, bq, bkv, bq_compute, bkv_compute, left, right, offset = case
+  num_q_tiles, num_kv_tiles = bq // bq_compute, bkv // bkv_compute
+  mask = static_mask(seq_q, seq_kv, left, right, offset)
+  plans = window_fragment_plans(
+      bq=bq, bkv=bkv, bq_compute=bq_compute, bkv_compute=bkv_compute,
+      left=left, right=right, causal_offset=offset)
+  params = dense_fwd_params(
+      num_q_heads=1, head_fold=1, q_heads_per_kv_head=1, seqlen_q=seq_q,
+      seqlen_kv=seq_kv, bq=bq, bkv=bkv, left=left, right=right, offset=offset)
+  sched = make_dense_fwd_schedule(params)
+  for si in range(sched.num_rows):
+    lo, hi, ctx = sched.row_interval(np.int32(si))
+    qi = sched.first_row + si
+    started = set()
+    for kv in range(int(lo), int(hi) + 1):
+      tiles = mask[qi * bq:(qi + 1) * bq, kv * bkv:(kv + 1) * bkv].reshape(
+          num_q_tiles, bq_compute, num_kv_tiles, bkv_compute)
+      is_visible = tiles.any(axis=(1, 3))
+      is_full = tiles.all(axis=(1, 3))
+      is_partial, _ = sched.block_flags(np.int32(si), np.int32(kv), ctx)
+      if is_partial:
+        plan = plans[kv * bkv - qi * bq]
+        fragments = {(f.q_tile, f.kv_tile): f for f in plan}
+        for q_tile in range(num_q_tiles):
+          tile_fragments = [f for f in plan if f.q_tile == q_tile]
+          if q_tile in started:
+            assert (q_tile, 0) in fragments, (qi, kv, q_tile)
+          for kv_tile in range(num_kv_tiles):
+            fragment = fragments.get((q_tile, kv_tile))
+            if is_visible[q_tile, kv_tile]:
+              assert fragment.needs_mask == (not is_full[q_tile, kv_tile])
+              if q_tile not in started:
+                assert fragment.starts_band or (kv == lo and kv_tile == 0)
+                started.add(q_tile)
+            else:
+              assert fragment is None or q_tile in started, (qi, kv, q_tile)
+          if tile_fragments:
+            assert tile_fragments[-1].checks_guard, (qi, kv, q_tile)
+      else:
+        assert is_full.all(), (qi, kv)
+        started.update(range(num_q_tiles))
 
 
 class PerSeqRow(NamedTuple):
@@ -338,7 +403,7 @@ PAGE_ID_STRIDE = 1000
 
 
 def replay_paged_fwd(cu_q, seqused_k, q_pad, bq, bkv, page_size,
-                     pages_per_seq, causal):
+                     pages_per_seq, causal, left=None):
   """Walks one head group of the paged schedule; each visited block is (kv,
   first kv token, needs_bounds). Returns (sched, rows, table)."""
   cu_q_array = jnp.asarray(cu_q, jnp.int32)
@@ -351,7 +416,7 @@ def replay_paged_fwd(cu_q, seqused_k, q_pad, bq, bkv, page_size,
       jnp.asarray(table.reshape(-1), jnp.int32), num_head_groups=1,
       q_heads_per_kv_head=1, padded_total_q=q_pad, bq=bq, bkv=bkv,
       page_size=page_size, pages_per_seq=pages_per_seq, causal=causal,
-      num_rows=num_rows)
+      left=left, num_rows=num_rows)
   rows = []
   for si in range(num_rows):
     lo, hi, ctx = sched.row_interval(jnp.int32(si))
@@ -392,13 +457,21 @@ PAGED_CASES = [
 ]
 
 
+# Note (david): a left edge on the diagonal, inside one kv block, and reaching
+# back past several kv blocks.
+PAGED_LEFTS = [None, 0, 37, 300]
+
+
+@pytest.mark.parametrize("left", PAGED_LEFTS)
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("case", PAGED_CASES)
-def test_paged_fwd_schedule_matches_the_mask(case, causal):
+def test_paged_fwd_schedule_matches_the_mask(case, causal, left):
   cu_q, seqused_k, q_pad, bq, bkv, page_size, pages_per_seq = case
   sched, rows, table = replay_paged_fwd(
-      cu_q, seqused_k, q_pad, bq, bkv, page_size, pages_per_seq, causal)
+      cu_q, seqused_k, q_pad, bq, bkv, page_size, pages_per_seq, causal,
+      left)
   assert int(sched.packed_q_end) == cu_q[-1]
+  assert sched.has_q_span == (left is not None)
   # Note (david): sequence r attends its own logical kv axis [0, seqused_k[r])
   # from token 0, bottom-right aligned; rows outside every sequence see
   # nothing.
@@ -407,7 +480,11 @@ def test_paged_fwd_schedule_matches_the_mask(case, causal):
   mask = np.zeros((q_pad, kv_cap), bool)
   for seq in range(len(seqused_k)):
     offset = seqused_k[seq] - cu_q[seq + 1]
-    visible = k_ids <= q_ids + offset if causal else True
+    right_visible = k_ids <= q_ids + offset if causal else True
+    if left is None:
+      visible = right_visible
+    else:
+      visible = right_visible & (q_ids + offset - left <= k_ids)
     mask |= ((cu_q[seq] <= q_ids) & (q_ids < cu_q[seq + 1])
              & (k_ids < seqused_k[seq]) & visible)
 
@@ -432,6 +509,9 @@ def test_paged_fwd_schedule_matches_the_mask(case, causal):
       assert k_tok == kv * bkv, (row.si, kv, k_tok)
       covered |= set(range(k_tok, k_tok + bkv))
     assert needed <= covered, (row.si, sorted(needed - covered)[:4])
+    # Note (david): every kept row sees at least its own diagonal key here, so
+    # the first visited block is exactly the one owning the first needed key:
+    # a left window skips every block before it.
     visited = [kv for kv, _, _ in row.blocks]
     if needed:
       assert visited[-1] == max(needed) // bkv, (row.si, visited)
@@ -449,10 +529,18 @@ def test_paged_fwd_schedule_matches_the_mask(case, causal):
       if needs_bounds:
         k_abs = jnp.arange(k_tok, k_tok + bkv, dtype=jnp.int32)[None, :]
         lower, span = sched.q_bounds(row.ctx, jnp.int32(kv), k_abs)
-        assert span is None
-        np.testing.assert_array_equal(
-            valid_rows[:, None] >= np.asarray(lower)[0][None, :], block_mask,
-            err_msg=str((row.si, kv)))
+        assert (span is not None) == sched.has_q_span
+        lower = np.asarray(lower)[0]
+        if span is None:
+          actual = valid_rows[:, None] >= lower[None, :]
+        else:
+          # Note (david): the kernel's one unsigned comparison, where a row
+          # below lower wraps past any span.
+          relative_ids = (valid_rows[:, None] - lower[None, :]).astype(
+              np.uint32)
+          actual = relative_ids < np.asarray(span)[0].astype(np.uint32)
+        np.testing.assert_array_equal(actual, block_mask,
+                                      err_msg=str((row.si, kv)))
       else:
         assert block_mask.all(), (row.si, kv)
       # Note (david): a lookup past the row's last page may read any entry of
