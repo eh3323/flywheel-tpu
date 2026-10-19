@@ -638,6 +638,32 @@ def test_flash_attn_varlen_window(
             window_size=window_size)
 
 
+@pytest.mark.parametrize(
+    "causal,window_size", [(False, (-1, -1)), (True, (-1, 0)), (True, (160, 0))])
+def test_flash_attn_varlen_overflow_guard_recovery(causal, window_size):
+    # Note (david): as in test_flash_attn_overflow_guard_recovery, scaled keys
+    # in each sequence's last quarter push late rows past the guard, so their
+    # blocks replay. The replay is rolled and traces its kv tile, and 128-key
+    # tiles under 512-key blocks make it pick each tile's bounds rows (the
+    # span too under the left window) from four static lane slices.
+    seqlens = [300, 212]
+    segments = []
+    for index, seqlen in enumerate(seqlens):
+        q, k, v = random_qkv(index, 1, seqlen, 4, 2, 64, jnp.bfloat16)
+        segments.append((q, k.at[:, 3 * seqlen // 4:].multiply(40.0), v))
+    q, k, v = (jnp.concatenate([segment[axis][0] for segment in segments])
+               for axis in range(3))
+    cu = cu_seqlens_of(seqlens)
+    out = flash_attn_varlen_func(
+        q, k, v, cu, cu, max(seqlens), max(seqlens), causal=causal,
+        window_size=window_size, interpret=INTERPRET,
+        block_sizes=(256, 512, 128, 128))
+    for index, segment in enumerate(segments):
+        rows = slice(int(cu[index]), int(cu[index + 1]))
+        assert_close_to_reference(
+            out[rows][None], *segment, causal=causal, window_size=window_size)
+
+
 def test_flash_attn_varlen_is_forward_only():
     seqlens = [37, 53, 22]
     cu = cu_seqlens_of(seqlens)

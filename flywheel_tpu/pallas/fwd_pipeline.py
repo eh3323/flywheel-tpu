@@ -218,6 +218,14 @@ def fwd_body(
   # while later keys stay visible; anchoring on that masked score would push
   # the row's first visible key past the guard into a replay.
   defers_row_start = window[0] is not None or schedule.has_q_span
+  # Note (david): the guard replay is rare, so a per-seq build rolls its
+  # fragment loop instead of unrolling one more pipeline copy per mask
+  # variant. Its fragment coordinates are then traced: q and kv rows take
+  # alignment hints, and the bounds tile is picked from static lane slices,
+  # since Mosaic slices lanes only at a static offset.
+  rolls_recovery = is_per_seq
+  assert not (rolls_recovery and (transposed_pv or not is_head_dim_minor)), (
+      "rolled fragment tiles need the token axis on rows")
 
   if token_major is None:
     width_qk = width_v = q_heads_per_row = kv_heads_per_row = None
@@ -606,14 +614,22 @@ def fwd_body(
           kv_tok + kv_compute_index * bkv_compute
           < schedule.kv_frontier(ctx, q_last))
 
+    def _tile_rows(index, size, is_rolled):
+      """pl.ds over the index-th tile of size rows. An unrolled copy's index
+      folds to a constant; a rolled loop's stays traced and takes the hint."""
+      start = index * size
+      if is_rolled:
+        start = pl.multiple_of(start, size)
+      return pl.ds(start, size)
+
     def _paged_fragment(kv_compute_index, kv_part):
       """The block's (bkv_compute, head_dim) K (kv_part 0) or V (kv_part 1)
       plane tile."""
       tile_start = pl.multiple_of(kv_compute_index * bkv_compute, NUM_LANES)
       return kv_planes[kv_part, pl.ds(tile_start, bkv_compute), :]
 
-    def _qk(g, kv_compute_index, q_compute_index):
-      slice_q = pl.ds(q_compute_index * bq_compute, bq_compute)
+    def _qk(g, kv_compute_index, q_compute_index, is_rolled=False):
+      slice_q = _tile_rows(q_compute_index, bq_compute, is_rolled)
       if is_paged:
         if gqa_fold > 1:
           # Note (david): the q tile's tokens of every folded head, stacked
@@ -629,7 +645,7 @@ def fwd_body(
       else:
         q_ref, q_half = _fold_lane(q_buf.at[q_slot], g, bq, lane_width_qk)
         k_ref, k_half = _fold_lane(k_buf.at[kv_slot], g, bkv, lane_width_qk)
-        slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
+        slice_k = _tile_rows(kv_compute_index, bkv_compute, is_rolled)
         if is_head_dim_minor:
           q = _take_half(q_ref[slice_q, :], q_half, lane_width_qk)
           k = _take_half(k_ref[slice_k, :], k_half, lane_width_qk)
@@ -648,7 +664,7 @@ def fwd_body(
         return raw_logits
 
     def _masked_scores(kv_compute_index, q_compute_index, logits, needs_mask,
-                       apply_bounds):
+                       apply_bounds, is_rolled=False):
       # Note (david): per-seq bounds live in unshifted q coordinates, while the
       # static window lives in coordinates shifted by causal_offset.
       q_unshifted = q_tok + q_compute_index * bq_compute
@@ -687,20 +703,32 @@ def fwd_body(
         # window, so every other build keeps a single comparison.
         q_ids = q_unshifted + lax.broadcasted_iota(
             jnp.int32, token_tile_shape, 0)
-        slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
         staged_bounds = bounds_buf.at[0]
+
+        def _bounds_tile(row):
+          if not is_rolled:
+            slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
+            return staged_bounds[row:row + 1, slice_k]
+          tile = staged_bounds[row:row + 1, 0:bkv_compute]
+          for kv_tile in range(1, num_k_compute_tiles):
+            tile = jnp.where(
+                kv_compute_index == kv_tile,
+                staged_bounds[row:row + 1, pl.ds(kv_tile * bkv_compute,
+                                                 bkv_compute)],
+                tile)
+          return tile
+
         if schedule.has_q_span:
           scores = apply_packed_bounds_mask(
               window_masked,
               DEFAULT_MASK_VALUE,
               q_ids,
-              staged_bounds[0:1, slice_k],
-              staged_bounds[1:2, slice_k],
+              _bounds_tile(0),
+              _bounds_tile(1),
           )
         else:
           scores = jnp.where(
-              q_ids >= staged_bounds[0:1, slice_k], window_masked,
-              DEFAULT_MASK_VALUE,
+              q_ids >= _bounds_tile(0), window_masked, DEFAULT_MASK_VALUE,
           )
       else:
         scores = window_masked
@@ -708,7 +736,7 @@ def fwd_body(
 
     def _online_softmax(
         g, kv_compute_index, q_compute_index, logits, needs_mask,
-        guard_recovery, apply_bounds, window_fragment=None,
+        guard_recovery, apply_bounds, window_fragment=None, is_rolled=False,
     ):
       """window_fragment is the fragment's static plan entry on a window
       block copy, None on the generic copies."""
@@ -717,9 +745,9 @@ def fwd_body(
       row_sum_new_ref = row_sum_scratch.at[new_parity, head_rows]
       row_max_scratch_g = row_max_scratch.at[head_rows]
 
-      slice_q = pl.ds(q_compute_index * frag_rows, frag_rows)
+      slice_q = _tile_rows(q_compute_index, frag_rows, is_rolled)
       scores = _masked_scores(kv_compute_index, q_compute_index, logits,
-                              needs_mask, apply_bounds)
+                              needs_mask, apply_bounds, is_rolled=is_rolled)
 
       read_parity = jnp.where(kv_compute_index == 0, old_parity, new_parity)
       row_sum_read_ref = row_sum_scratch.at[read_parity, head_rows]
@@ -815,6 +843,7 @@ def fwd_body(
 
     def _pv(
         g, kv_compute_index, q_compute_index, probs, is_row_start, rescale,
+        is_rolled=False,
     ):
       """rescale is the fragment's recovery rescale, None on the ordinary
       pass."""
@@ -827,7 +856,7 @@ def fwd_body(
             preferred_element_type=jnp.float32)
       else:
         v_ref, v_half = _fold_lane(v_buf.at[kv_slot], g, bkv, lane_width_v)
-        slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
+        slice_k = _tile_rows(kv_compute_index, bkv_compute, is_rolled)
         if is_head_dim_minor:
           o_curr = lax.dot_general(
               probs, _take_half(v_ref[slice_k, :], v_half, lane_width_v),
@@ -844,7 +873,7 @@ def fwd_body(
               probs, v_ref[:, slice_k], NT_DIM_NUMBERS,
               preferred_element_type=jnp.float32)
 
-      slice_q = pl.ds(q_compute_index * frag_rows, frag_rows)
+      slice_q = _tile_rows(q_compute_index, frag_rows, is_rolled)
       read_parity = jnp.where(kv_compute_index == 0, old_parity, new_parity)
       if transposed_pv:
         # Note (david): q is the lane axis of the transposed o scratch, and
@@ -915,6 +944,7 @@ def fwd_body(
       def _resolve_g(g):
         return static_g if static_g is not None else g
 
+      is_rolled = guard_recovery and rolls_recovery
       first_g, first_k, first_q = (
           jnp.int32(coord) for coord in _fragment_coords(0))
       logits = _qk(_resolve_g(first_g), first_k, first_q)
@@ -933,14 +963,16 @@ def fwd_body(
           is_active = True
 
         def _process_active(_):
-          logits = _qk(_resolve_g(current_g), current_k, current_q)
+          logits = _qk(_resolve_g(current_g), current_k, current_q,
+                       is_rolled=is_rolled)
           probs_curr, is_row_start_curr, rescale_curr = _online_softmax(
               _resolve_g(current_g), current_k, current_q, logits, is_causal,
               guard_recovery=guard_recovery, apply_bounds=apply_bounds,
+              is_rolled=is_rolled,
           )
           _pv(
               _resolve_g(prev_g), prev_k, prev_q, probs_prev,
-              is_row_start_prev, rescale_prev,
+              is_row_start_prev, rescale_prev, is_rolled=is_rolled,
           )
           return (probs_curr, is_row_start_curr, rescale_curr, current_g,
                   current_k, current_q)
@@ -954,11 +986,11 @@ def fwd_body(
           _pipeline_step,
           (probs_first, is_row_start_first, rescale_first, first_g, first_k,
            first_q),
-          unroll=True,
+          unroll=not is_rolled,
       )
       _pv(
           _resolve_g(last_g), last_k, last_q, probs_last, is_row_start_last,
-          rescale_last,
+          rescale_last, is_rolled=is_rolled,
       )
 
     def _run_group(is_causal, apply_bounds, window_fragments=None):

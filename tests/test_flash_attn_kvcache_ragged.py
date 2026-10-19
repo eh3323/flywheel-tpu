@@ -1159,3 +1159,34 @@ def test_paged_replay_rescale_survives_skipped_fragment():
   actual = run_paged(*case, causal=True, max_seqlen_k=num_pages * page_size,
                      block_sizes=(1024, 1024, 512, 256))
   assert_extend_matches(actual, expected, case[5], case[6], 1)
+
+
+@pytest.mark.parametrize("window_left", [300, 600, 900])
+def test_paged_window_replay_picks_span_per_kv_tile(window_left):
+  # Note (david): keys [0, 256) score 0 and keys [256, 1024) ~200 nats, so
+  # rows that see both anchor on kv tile 0 and replay. The rolled replay
+  # traces its kv tile and picks that tile's span row from static lane
+  # slices; the left edge cuts kv tiles 1-3 at row-dependent offsets, and
+  # each key carries its own value, so a wrong span row changes the output.
+  length, heads, head_dim = 1024, 1, 128
+  num_pages, page_size = 8, 128
+  scale = 1 / math.sqrt(head_dim)
+  direction = np.zeros(head_dim)
+  direction[0] = 1.0
+  magnitude = math.sqrt(200.0 / scale)
+  q = np.broadcast_to(magnitude * direction, (length, heads, head_dim))
+  k = np.zeros((length, heads, head_dim))
+  k[256:] = magnitude * direction
+  v = (1.0 + np.arange(length)[:, None, None] / length) * np.ones(
+      (length, heads, head_dim))
+  pages = np.zeros((num_pages, page_size, heads, head_dim))
+
+  case = (bf16(q), bf16(pages), bf16(pages), bf16(k), bf16(v),
+          jnp.array([0, length], jnp.int32), jnp.array([0], jnp.int32),
+          jnp.arange(num_pages, dtype=jnp.int32)[None])
+  expected = ragged_reference(*case, causal=True, window_left=window_left)
+  actual = run_paged(*case, causal=True, window_size=(window_left, 0),
+                     max_seqlen_k=num_pages * page_size,
+                     block_sizes=(1024, 1024, 512, 256))
+  assert np.all(np.isfinite(np.asarray(actual[0], np.float32)))
+  assert_extend_matches(actual, expected, case[5], case[6], 1)
