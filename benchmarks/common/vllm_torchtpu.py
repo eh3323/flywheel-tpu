@@ -1,15 +1,17 @@
-"""SHA-pinned loader for vLLM TorchTPU's batched RPA kernel, the kernel its
-`--attention-backend CUSTOM` serves with.
+"""SHA-pinned loader for vLLM TorchTPU's kernels: batched RPA, the kernel its
+`--attention-backend CUSTOM` serves softmax attention with, and the GDN v3
+kernel it serves GDN and KDA linear attention with.
 
---batched-rpa-source defaults to the third_party/vllm-torchtpu submodule
+--vllm-torchtpu-source defaults to the third_party/vllm-torchtpu submodule
 (git submodule update --init third_party/vllm-torchtpu). Every
-src/vllm_torchtpu file the kernel imports is verified against its SHA-256 at
-BATCHED_RPA_GIT_SHA, the submodule pin, and the kernel is imported through the
-real vllm_torchtpu package, so the import-time JAX patches and libtpu flag
-defaults vLLM TorchTPU serves with apply here too. Those files need only JAX;
-no vLLM or torch install.
+src/vllm_torchtpu file either kernel imports is verified against its SHA-256
+at VLLM_TORCHTPU_GIT_SHA, the submodule pin, and the kernels are imported
+through the real vllm_torchtpu package before JAX starts its backend, so the
+import-time JAX patches and libtpu flag defaults vLLM TorchTPU serves with
+apply here too. Those files need only JAX; no vLLM or torch install. The
+patches are process-wide, so flywheel is timed in a process of its own.
 
-    PYTHONPATH=. uv run --no-sync python benchmarks/common/batched_rpa.py   # host-only self-test
+    PYTHONPATH=. uv run --no-sync python benchmarks/common/vllm_torchtpu.py   # host-only self-test
 """
 
 from __future__ import annotations
@@ -19,13 +21,14 @@ import importlib
 import sys
 from pathlib import Path
 
-DEFAULT_BATCHED_RPA_SOURCE = Path(__file__).resolve().parents[2] / (
+DEFAULT_VLLM_TORCHTPU_SOURCE = Path(__file__).resolve().parents[2] / (
     "third_party") / "vllm-torchtpu"
-BATCHED_RPA_GIT_SHA = "fe86920a4c851ed80c82ad78ca9ea7cc88add3a6"
+VLLM_TORCHTPU_GIT_SHA = "fe86920a4c851ed80c82ad78ca9ea7cc88add3a6"
 BATCHED_RPA_PACKAGE = "vllm_torchtpu.kernels.experimental.batched_rpa"
-# The kernel's whole vllm_torchtpu import closure, relative to
+GDN_V3_PACKAGE = "vllm_torchtpu.kernels.gdn.v3"
+# Both kernels' whole vllm_torchtpu import closure, relative to
 # src/vllm_torchtpu.
-BATCHED_RPA_SOURCE_SHA256 = {
+VLLM_TORCHTPU_SOURCE_SHA256 = {
     "__init__.py":
         "a1fc9f8de9942c0e27dfa639e4acfa59b48aa0443189eb33ff0609f1f14cba3d",
     "env_override.py":
@@ -58,6 +61,30 @@ BATCHED_RPA_SOURCE_SHA256 = {
         "1c917940957aef3c04f24e6125b78a31e1229c2221dbf6ad6dd2c519947858d5",
     "kernels/experimental/batched_rpa/wrapper.py":
         "67380581df5ac1bdc67e403e36b264c9248fcc7946814653a2c099eafdb782ff",
+    "kernels/gdn/__init__.py":
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "kernels/gdn/v3/__init__.py":
+        "43955acccf4b719dbab4dceb4c9437274dc864bf3d15b22c252cd9d010255c7d",
+    "kernels/gdn/v3/compute_conv1d.py":
+        "f4f4bccb0d553ddf2ee9767e3c83b38ad1e839f6f8e8e74c7d9f70f14e5603c7",
+    "kernels/gdn/v3/compute_gdn.py":
+        "9d138ad1dca9d22d415321a159614ea52dc303a14bc42eaf58ec57f8819612b3",
+    "kernels/gdn/v3/compute_kda.py":
+        "e0565c2c9dfd6a5c501893f5af2336fc6676f717637b77a44bcfe272ab87b018",
+    "kernels/gdn/v3/config.py":
+        "cade8aaf377f549b8f5fdaea4195bf34aac75a04716872c5d5eea52473e075c8",
+    "kernels/gdn/v3/memory_ref.py":
+        "5491f7811cd09f88a8ed78258dfcbcc39f73630dbf28c0aa44e805004b1807d9",
+    "kernels/gdn/v3/metadata.py":
+        "c425de2d55d4db23cb1d7171ed9f03e05eabed74df370b0ba39a9264767e4210",
+    "kernels/gdn/v3/tiling.py":
+        "36bba1bdf572efd19468b48488cbebf3321da84f778cfe82f21136a2200bce33",
+    "kernels/gdn/v3/vmem_ldst.py":
+        "42e3e57832298993644d789bb0fccdd1eb7ac4232d0ef2d08f246143525326fa",
+    "kernels/gdn/v3/wrapper.py":
+        "7a134197d3ed3b40d8753a683e3d5bf9208ced8aa6cb6d730144a5f41a21900e",
+    "kernels/typed_ldst.py":
+        "accdb5db52dbdf541497e5dd88750e8ea92ff21dbb6430a4d7a82c597f874834",
     "logger.py":
         "2505160410a746207d8a406b64ac26e2b8fb6090d58dc1c726ba25ccb5650136",
     "patch_registry.py":
@@ -65,36 +92,36 @@ BATCHED_RPA_SOURCE_SHA256 = {
 }
 # The page size vLLM TorchTPU allocates under --attention-backend CUSTOM when
 # --block-size is not given (PallasBatchedRPAAttentionBackend.
-# get_preferred_block_size at BATCHED_RPA_GIT_SHA).
+# get_preferred_block_size at VLLM_TORCHTPU_GIT_SHA).
 CUSTOM_PAGE_SIZE = 256
 # JAX device_kind -> pltpu.ChipVersion value, for get_kv_cache_shape, which
 # vLLM TorchTPU resolves from the accelerator type instead of a live device.
 CHIP_VERSIONS = {"TPU v6 lite": "v6e", "TPU7x": "7x"}
 
 
-def validate_batched_rpa_source(source_root: Path) -> Path:
+def validate_vllm_torchtpu_source(source_root: Path) -> Path:
     """The src/vllm_torchtpu directory inside a vLLM TorchTPU checkout."""
     source_root = Path(source_root).expanduser().resolve()
     package_root = source_root / "src" / "vllm_torchtpu"
-    missing = [name for name in BATCHED_RPA_SOURCE_SHA256
+    missing = [name for name in VLLM_TORCHTPU_SOURCE_SHA256
                if not (package_root / name).is_file()]
     if missing:
         raise FileNotFoundError(
-            f"{package_root} is missing {missing}; --batched-rpa-source must "
-            f"be a vLLM TorchTPU checkout at {BATCHED_RPA_GIT_SHA} (for the "
-            f"default, run git submodule update --init "
+            f"{package_root} is missing {missing}; --vllm-torchtpu-source "
+            f"must be a vLLM TorchTPU checkout at {VLLM_TORCHTPU_GIT_SHA} (for "
+            f"the default, run git submodule update --init "
             f"third_party/vllm-torchtpu).")
-    for name, expected in BATCHED_RPA_SOURCE_SHA256.items():
+    for name, expected in VLLM_TORCHTPU_SOURCE_SHA256.items():
         digest = hashlib.sha256((package_root / name).read_bytes()).hexdigest()
         if digest != expected:
             raise ValueError(
                 f"{package_root / name} does not match vLLM TorchTPU "
-                f"{BATCHED_RPA_GIT_SHA}; got sha256 {digest}.")
+                f"{VLLM_TORCHTPU_GIT_SHA}; got sha256 {digest}.")
     return package_root
 
 
-def load_batched_rpa(source_root: Path):
-    """The pinned batched RPA (wrapper, configs) modules.
+def load_pinned_modules(source_root: Path, package: str, names):
+    """The pinned modules package.<name> for each of names.
 
     Call it before JAX starts its backend: importing vllm_torchtpu sets the
     LIBTPU_INIT_ARGS defaults vLLM TorchTPU serves with (among them the
@@ -103,23 +130,35 @@ def load_batched_rpa(source_root: Path):
     """
     from jax._src import xla_bridge
 
-    package_root = validate_batched_rpa_source(source_root)
+    package_root = validate_vllm_torchtpu_source(source_root)
     if "vllm_torchtpu" in sys.modules:
         raise RuntimeError(
-            "vllm_torchtpu was imported before the pinned batched RPA source; "
-            "refusing to benchmark an ambiguous baseline.")
+            "vllm_torchtpu was imported before the pinned vLLM TorchTPU "
+            "source; refusing to benchmark an ambiguous baseline.")
     if xla_bridge.backends_are_initialized():
         raise RuntimeError(
-            "JAX started its backend before batched RPA was loaded, so vLLM "
-            "TorchTPU's LIBTPU_INIT_ARGS defaults would not apply.")
+            "JAX started its backend before vLLM TorchTPU was loaded, so its "
+            "LIBTPU_INIT_ARGS defaults would not apply.")
     sys.path.insert(0, str(package_root.parent))
-    wrapper = importlib.import_module(f"{BATCHED_RPA_PACKAGE}.wrapper")
-    configs = importlib.import_module(f"{BATCHED_RPA_PACKAGE}.configs")
+    modules = tuple(importlib.import_module(f"{package}.{name}")
+                    for name in names)
     loaded = Path(sys.modules["vllm_torchtpu"].__file__).resolve()
     if loaded.parent != package_root:
         raise RuntimeError(
             f"vllm_torchtpu resolved to {loaded}, not {package_root}.")
-    return wrapper, configs
+    return modules
+
+
+def load_batched_rpa(source_root: Path):
+    """The pinned batched RPA (wrapper, configs) modules."""
+    return load_pinned_modules(source_root, BATCHED_RPA_PACKAGE,
+                               ("wrapper", "configs"))
+
+
+def load_gdn_v3(source_root: Path):
+    """The pinned GDN v3 (wrapper, config) modules."""
+    return load_pinned_modules(source_root, GDN_V3_PACKAGE,
+                               ("wrapper", "config"))
 
 
 def chip_version(device_kind: str):
@@ -133,7 +172,7 @@ def chip_version(device_kind: str):
 
 
 def self_test():
-    validate_batched_rpa_source(DEFAULT_BATCHED_RPA_SOURCE)
+    validate_vllm_torchtpu_source(DEFAULT_VLLM_TORCHTPU_SOURCE)
     print("self-test ok")
 
 

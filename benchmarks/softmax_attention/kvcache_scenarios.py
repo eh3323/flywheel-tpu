@@ -44,8 +44,8 @@ import sys
 
 import numpy as np
 
-from benchmarks.common.batched_rpa import (
-    DEFAULT_BATCHED_RPA_SOURCE,
+from benchmarks.common.vllm_torchtpu import (
+    DEFAULT_VLLM_TORCHTPU_SOURCE,
     chip_version,
     load_batched_rpa,
 )
@@ -449,7 +449,7 @@ def main(argv=None):
         return 0
     if cell.impl == "batched_rpa":
         # Before run() starts the JAX backend.
-        args.batched_rpa = load_batched_rpa(args.batched_rpa_source)
+        args.batched_rpa = load_batched_rpa(args.vllm_torchtpu_source)
     record = run(cell, args)
     if args.output:
         write_record(args.output, record)
@@ -487,8 +487,8 @@ def parse_args(argv=None):
                              "compiles alongside; default: RPA's formula")
     parser.add_argument("--rpa-source", type=pathlib.Path,
                         default=DEFAULT_RPA_SOURCE)
-    parser.add_argument("--batched-rpa-source", type=pathlib.Path,
-                        default=DEFAULT_BATCHED_RPA_SOURCE)
+    parser.add_argument("--vllm-torchtpu-source", type=pathlib.Path,
+                        default=DEFAULT_VLLM_TORCHTPU_SOURCE)
     parser.add_argument("--output", type=pathlib.Path)
     parser.add_argument("--trace", type=pathlib.Path,
                         help="also trace one scenario into this directory")

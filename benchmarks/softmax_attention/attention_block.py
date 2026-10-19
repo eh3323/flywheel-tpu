@@ -52,9 +52,9 @@ import sys
 
 import numpy as np
 
-from benchmarks.common.batched_rpa import (
+from benchmarks.common.vllm_torchtpu import (
     CUSTOM_PAGE_SIZE,
-    DEFAULT_BATCHED_RPA_SOURCE,
+    DEFAULT_VLLM_TORCHTPU_SOURCE,
     chip_version,
     load_batched_rpa,
 )
@@ -432,7 +432,7 @@ def main(argv=None):
         return 0
     if cell.impl == "batched_rpa":
         # Before jax.default_backend() below starts the backend.
-        args.batched_rpa = load_batched_rpa(args.batched_rpa_source)
+        args.batched_rpa = load_batched_rpa(args.vllm_torchtpu_source)
 
     import jax
 
@@ -484,8 +484,8 @@ def parse_args(argv=None):
                         default=DEFAULT_RPA_SOURCE)
     parser.add_argument("--splash-source", type=pathlib.Path,
                         default=DEFAULT_SPLASH_SOURCE)
-    parser.add_argument("--batched-rpa-source", type=pathlib.Path,
-                        default=DEFAULT_BATCHED_RPA_SOURCE)
+    parser.add_argument("--vllm-torchtpu-source", type=pathlib.Path,
+                        default=DEFAULT_VLLM_TORCHTPU_SOURCE)
     return parser.parse_args(argv)
 
 
