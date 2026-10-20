@@ -6,6 +6,11 @@
 </p>
 
 ## News
+- [2026/10] FlyWheel 0.3.0 is released: sliding window attention that skips
+  masked tiles (up to 1.47x over Splash and 2.25x over RPA v3 on 16K windowed
+  prefill, TPU v6e), sliding window and softcap on the paged KV cache, and
+  [ReplaySSM](https://arxiv.org/abs/2610.13778) decode for GDN/KDA linear
+  attention (up to 1.48x on decode and 2.18x on 4-token speculative verify).
 - [2026/10] FlyWheel 0.2.0 is released: faster chunked prefill, prefix caching
   and decode over a paged KV cache, now ahead of RPA v3 on TPU v7x (up to 2.32x
   on chunked prefill and 1.14x on decode).
@@ -153,8 +158,8 @@ Arguments:
         cache, read-only: one merged (num_blocks, page_block_size, 2 * nheads_k, headdim)
         cache whose token rows interleave each KV head's K row and V row, [k0, v0, k1, v1,
         ...], with v and cu_seqlens_k None. page_block_size and headdim are multiples of 128;
-        any nheads_k. q stays head-major; token_major, window_size, softcap and rotary_k=True
-        are not supported.
+        any nheads_k. q stays head-major; token_major and rotary_k=True are not supported,
+        and window_size takes a right bound of -1 or 0 only (causal forces 0).
     seqused_k [optional]: (batch_size,), int. With block_table, each sequence's kv length,
         its new tokens included, which the cache must already hold; max_seqlen_k bounds it.
     num_active [optional]: int, may be traced. With block_table, only the first num_active
@@ -170,7 +175,8 @@ Return:
 flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, *, cache_seqlens,
                         cache_batch_idx=None, block_table=None, num_active=None,
                         cu_seqlens_q=None, softmax_scale=None, causal=False,
-                        window_size=(-1, -1), return_softmax_lse=False, interpret=False):
+                        window_size=(-1, -1), softcap=0.0, return_softmax_lse=False,
+                        interpret=False):
 """
 If k and v are not None, they are appended to the cache after each row's cache_seqlens
 entries, and attention runs against the updated cache, all in 1 kernel. This is useful for
@@ -200,8 +206,8 @@ attention matrix, as in flash_attn_func. A decode row with nothing to attend ret
 and lse = -inf; on multi-token and packed calls, as in flash_attn_varlen_func, a row with no
 visible key is unspecified.
 
-If window_size != (-1, -1), implements sliding window local attention, for single-token
-decode only.
+If window_size != (-1, -1), implements sliding window local attention. Multi-token and
+packed calls take a window right bound of -1 or 0 only (causal forces 0).
 
 Arguments:
     q: (batch_size, seqlen_q, nheads, headdim), or (total_q, nheads, headdim) with
@@ -230,7 +236,7 @@ Arguments:
         unspecified on single-token decode.
     cu_seqlens_q [optional]: (batch_size + 1,), int. Nondecreasing query boundaries from 0 to
         at most total_q; buffer padding past cu_seqlens_q[-1] returns out = 0 and lse = -inf.
-    softmax_scale, causal, window_size: as in flash_attn_func.
+    softmax_scale, causal, window_size, softcap: as in flash_attn_func.
     cache_seqlens, cache_batch_idx, block_table, num_active and cu_seqlens_q may be traced.
 
 Return:
@@ -353,6 +359,16 @@ Arguments:
     The other arguments and the return are as in fused_conv1d_gdn.
 """
 ```
+
+For decode, `fused_conv1d_gdn_replay` and `fused_conv1d_kda_replay` run
+[ReplaySSM](https://arxiv.org/abs/2610.13778) (Liou et al., 2026): a decode
+sequence keeps its recurrent state as a checkpoint plus up to `replay_window`
+records of its recent tokens, computes its outputs from them without
+materializing the state, and writes a new checkpoint only when the records
+would overflow. Speculative tokens commit by moving `replay_lens`, so the
+recurrent state needs no per-position checkpoints. The paper implements GDN
+(and Mamba-2) in vLLM; the KDA variant is our extension. Their arguments are
+documented in their docstrings.
 
 Their implementations are in
 [gdn/wrapper.py](flywheel_tpu/linear_attention/gdn/wrapper.py) and
@@ -573,6 +589,6 @@ If you use FlyWheel in your research, please cite:
   author       = {Zishuo Bao and Zeshen Zhang and Yucheng Lu},
   year         = {2026},
   howpublished = {\url{https://github.com/heavyball-research/flywheel-tpu}},
-  note         = {Version 0.2.0}
+  note         = {Version 0.3.0}
 }
 ```
