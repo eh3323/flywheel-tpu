@@ -19,14 +19,11 @@
 #                     empty runs RPA's own formula
 #     SCENARIOS       default "chunked_prefill decode"; add verify for the
 #                     verify sweep below
-#     VERIFY_IMPLS    default "flywheel flywheel_tq rpa"; flywheel_fold
-#                     (non-causal, on the decode kernel) and
-#                     flywheel_fold_causal run on request
 #     VERIFY_HEADS    "heads heads_k head_dim" (default "32 8 128", Qwen3-4B)
 #     VERIFY_BATCHES  default "32 128"
 #     VERIFY_SEQS     kv tokens per sequence (default "2048 8192")
 #     VERIFY_TOKENS   query tokens per sequence per step (default "1 4 8 16");
-#                     1 runs each impl's decode path, flywheel_tq skips it
+#                     1 runs each impl's decode path
 #     VERIFY_STEPS    verify steps per timed call (default 8)
 
 set -euo pipefail
@@ -43,7 +40,6 @@ DECODE_BATCHES=${DECODE_BATCHES-"256 128"}
 # compiles RPA's mixed kernel as well, so it needs these blocks there too.
 RPA_K32_BLOCKS=${RPA_K32_BLOCKS-"128,256,128,256"}
 SCENARIOS=${SCENARIOS:-"chunked_prefill decode"}
-VERIFY_IMPLS=${VERIFY_IMPLS:-"flywheel flywheel_tq rpa"}
 VERIFY_HEADS=${VERIFY_HEADS:-"32 8 128"}
 VERIFY_BATCHES=${VERIFY_BATCHES:-"32 128"}
 VERIFY_SEQS=${VERIFY_SEQS:-"2048 8192"}
@@ -68,7 +64,7 @@ note "grid:       scenarios [$SCENARIOS]"
 note "            impls [$IMPLS] heads_k [$HEADS_K]"
 note "            decode batches [$DECODE_BATCHES]"
 if has_scenario verify; then
-  note "            verify impls [$VERIFY_IMPLS] heads [$VERIFY_HEADS]"
+  note "            verify heads [$VERIFY_HEADS]"
   note "            verify batches [$VERIFY_BATCHES] seqs [$VERIFY_SEQS]"
   note "            verify tokens [$VERIFY_TOKENS] steps $VERIFY_STEPS"
 fi
@@ -104,8 +100,7 @@ if has_scenario verify; then
   for seq in $VERIFY_SEQS; do
     for batch in $VERIFY_BATCHES; do
       for tokens in $VERIFY_TOKENS; do
-        for impl in $VERIFY_IMPLS; do
-          [[ $impl == flywheel_tq && $tokens == 1 ]] && continue
+        for impl in $IMPLS; do
           run --impl "$impl" --scenario verify --heads "$verify_heads" \
               --heads-k "$verify_heads_k" --head-dim "$verify_head_dim" \
               --seq "$seq" --batch "$batch" --verify-tokens "$tokens" \

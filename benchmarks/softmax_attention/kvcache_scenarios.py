@@ -31,20 +31,12 @@ kernel. RPA v3 runs ragged_paged_attention with the request distribution
 vLLM's TPU runner sends, mixed for chunked prefill and decode for decode, and
 its own default block sizes unless --rpa-blocks names some.
 
-On verify, flywheel's flash_attn_with_kvcache runs a window of at most
-MAX_FOLDED_QUERY_ROWS query rows per KV head as flywheel_fold_causal does, and
-a longer one on the ragged append plus the paged varlen kernel, which sizes
-its q block from the whole packed token count; flywheel_tq runs those two
-kernels with max_seqlen_q = --verify-tokens. rpa sends verify windows to the
-mixed case, as tpu-inference does (max_decode_tokens is 1). With
---verify-tokens 1 every impl but flywheel_tq runs its decode path.
-flywheel_fold runs the ragged append, then flywheel's decode kernel with the
-window folded into the GQA group: one query token per sequence carrying
-verify_tokens * heads query heads. The decode kernel has no per-row bound, so
-every window token sees the whole window (non-causal, DFlash's in-block
-attention, not the target's causal verify). flywheel_fold_causal runs the
-same fold with the kernel's query_tokens = --verify-tokens, which bounds each
-window token's keys bottom-right causally.
+On verify, flywheel's flash_attn_with_kvcache folds a window of at most
+MAX_FOLDED_QUERY_ROWS query rows per KV head into the query heads of its
+decode kernel, causal through the kernel's query_tokens, and runs a longer
+one on the ragged append plus the paged varlen kernel. rpa sends verify
+windows to the mixed case, as tpu-inference does (max_decode_tokens is 1).
+With --verify-tokens 1 both run their decode path.
 
 Only the kernel calls are inside the clock: q, k and v are drawn once and
 reused, so a step's inputs cost nothing. With --trace the scenario also runs
@@ -72,10 +64,9 @@ from benchmarks.common.rpa import (
 from benchmarks.common.timing import time_call
 from benchmarks.softmax_attention import segments as segments_lib
 
-IMPLS = ("flywheel", "flywheel_tq", "flywheel_fold", "flywheel_fold_causal",
-         "rpa")
+IMPLS = ("flywheel", "rpa")
 SCENARIOS = ("chunked_prefill", "decode", "verify")
-KERNEL_MARKERS = ("flash_attn", "RPA", "ragged_paged", "rpa_metadata")
+KERNEL_MARKERS = ("flash_attn", "RPA", "ragged_paged")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -160,13 +151,9 @@ class Cell:
 def attention_pairs(cell):
     """(query, key) pairs the whole scenario attends."""
     if cell.scenario == "verify":
-        # Note (david): window token t sees the context and t + 1 new tokens,
-        # or all of them when non-causal.
+        # Note (david): window token t sees the context and t + 1 new tokens.
         tokens = cell.verify_tokens
-        if cell.impl == "flywheel_fold":
-            per_step = tokens * cell.seq
-        else:
-            per_step = tokens * cell.context + tokens * (tokens + 1) // 2
+        per_step = tokens * cell.context + tokens * (tokens + 1) // 2
         return cell.num_calls * cell.batch * per_step
     if cell.scenario == "chunked_prefill":
         first_query, num_queries = 0, cell.seq
@@ -293,113 +280,6 @@ def build_flywheel(cell, inputs, args):
     return step, (lambda: fill_cache(shape, cell.dtype, generator)), {}
 
 
-def build_flywheel_tq(cell, inputs, args):
-    """(step, fresh_state, info) running flash_attn_with_kvcache's verify
-    kernels, the ragged append and the paged varlen kernel, with the q block
-    sized from --verify-tokens instead of the packed token count."""
-    import jax
-    import jax.numpy as jnp
-
-    from flywheel_tpu import flash_attn_varlen_func
-    from flywheel_tpu.pallas.flash_fwd_kvcache_varlen import append_ragged
-
-    calls, block_table, starts = inputs
-    pages_per_seq = block_table.shape[1]
-    shape = (cell.num_seqs * pages_per_seq, cell.page_size,
-             2 * cell.heads_k, cell.head_dim)
-    cu_q_lens = (jnp.arange(cell.batch + 1, dtype=jnp.int32)
-                 * cell.verify_tokens)
-    flat_block_table = block_table.reshape(-1)
-    num_active = jnp.array([cell.batch], jnp.int32)
-
-    def call(cache, q, k, v, start):
-        cache = append_ragged(
-            cache, k, v, cu_q_lens, start, flat_block_table, num_active,
-            page_size=cell.page_size, pages_per_seq=pages_per_seq,
-            interpret=False)
-        out = flash_attn_varlen_func(
-            q.transpose(1, 0, 2), cache, None, cu_q_lens, None,
-            max_seqlen_q=cell.verify_tokens,
-            max_seqlen_k=pages_per_seq * cell.page_size, causal=True,
-            block_table=block_table, seqused_k=start + cell.verify_tokens)
-        return out, cache
-
-    kernel = jax.jit(call, donate_argnums=(0,))
-
-    def step(cache):
-        out = None
-        for (q, k, v), start in zip(calls, starts):
-            out, cache = kernel(cache, q, k, v, start)
-        return out, cache
-
-    generator = np.random.default_rng(1)
-    return step, (lambda: fill_cache(shape, cell.dtype, generator)), {}
-
-
-def build_flywheel_fold(cell, inputs, args):
-    """(step, fresh_state, info) running a verify window on flywheel's decode
-    kernel: the ragged append, then the decode kernel with one query token per
-    sequence and the window folded into the GQA group, causal through its
-    query_tokens for flywheel_fold_causal."""
-    import jax
-    import jax.numpy as jnp
-
-    from flywheel_tpu.flash_attn_interface import fused_q_scale
-    from flywheel_tpu.pallas.flash_fwd_kvcache import (
-        flash_attn_kvcache_pallas,
-    )
-    from flywheel_tpu.pallas.flash_fwd_kvcache_varlen import append_ragged
-
-    calls, block_table, starts = inputs
-    pages_per_seq = block_table.shape[1]
-    shape = (cell.num_seqs * pages_per_seq, cell.page_size,
-             2 * cell.heads_k, cell.head_dim)
-    tokens = cell.verify_tokens
-    group = cell.heads // cell.heads_k
-    cu_q_lens = jnp.arange(cell.batch + 1, dtype=jnp.int32) * tokens
-    flat_block_table = block_table.reshape(-1)
-    num_active = jnp.array([cell.batch], jnp.int32)
-    # Note (david): folded head (h, t, j) is window token t of query head
-    # h * group + j, so kv head h's tokens * group rows share its keys.
-    window_shape = (cell.batch, tokens, cell.heads_k, group, cell.head_dim)
-    folded_shape = (cell.batch, cell.heads_k * tokens * group, cell.head_dim)
-    no_new = jnp.zeros((cell.batch, cell.heads_k, cell.head_dim), cell.dtype)
-    cache_batch_idx = jnp.arange(cell.batch, dtype=jnp.int32)
-    # Note (david): the same log2-unit Q scale flash_attn_with_kvcache folds
-    # in before its decode kernel.
-    q_scale = fused_q_scale(1.0 / math.sqrt(cell.head_dim), 0.0)
-    query_tokens = tokens if cell.impl == "flywheel_fold_causal" else 1
-
-    def call(cache, q, k, v, start):
-        cache = append_ragged(
-            cache, k, v, cu_q_lens, start, flat_block_table, num_active,
-            page_size=cell.page_size, pages_per_seq=pages_per_seq,
-            interpret=False)
-        folded = (q.reshape(window_shape).transpose(0, 2, 1, 3, 4)
-                  .reshape(folded_shape))
-        folded = (folded.astype(jnp.float32) * q_scale).astype(q.dtype)
-        out, cache = flash_attn_kvcache_pallas(
-            folded, cache, None, no_new, no_new, start + tokens,
-            cache_batch_idx, cache_head_major=False, has_new=False,
-            left=None, return_lse=False, interpret=False,
-            block_table=flat_block_table, num_active=num_active,
-            merged_cache=True, query_tokens=query_tokens)
-        out = (out.reshape(cell.batch, cell.heads_k, tokens, group,
-                           cell.head_dim)
-               .transpose(0, 2, 1, 3, 4)
-               .reshape(cell.query_tokens, cell.heads, cell.head_dim))
-        return out, cache
-
-    kernel = jax.jit(call, donate_argnums=(0,))
-
-    def step(cache):
-        out = None
-        for (q, k, v), start in zip(calls, starts):
-            out, cache = kernel(cache, q, k, v, start)
-        return out, cache
-
-    generator = np.random.default_rng(1)
-    return step, (lambda: fill_cache(shape, cell.dtype, generator)), {}
 
 
 def build_rpa(cell, inputs, args):
@@ -469,9 +349,7 @@ def build_rpa(cell, inputs, args):
     return step, (lambda: fill_cache(shape, cell.dtype, generator)), info
 
 
-BUILDERS = {"flywheel": build_flywheel, "flywheel_tq": build_flywheel_tq,
-            "flywheel_fold": build_flywheel_fold,
-            "flywheel_fold_causal": build_flywheel_fold, "rpa": build_rpa}
+BUILDERS = {"flywheel": build_flywheel, "rpa": build_rpa}
 
 
 def trace_scenario(cell, step, state, directory):
@@ -575,15 +453,6 @@ def main(argv=None):
                 args.verify_tokens)
     if args.scenario == "chunked_prefill" and args.seq % args.chunk:
         raise SystemExit("--seq must be a multiple of --chunk.")
-    if args.impl == "flywheel_tq" and (
-            args.scenario != "verify" or args.verify_tokens < 2):
-        raise SystemExit("flywheel_tq runs verify with --verify-tokens >= 2.")
-    if args.impl in ("flywheel_fold",
-                     "flywheel_fold_causal") and args.scenario != "verify":
-        raise SystemExit(f"{args.impl} runs the verify scenario only.")
-    if args.impl.startswith("flywheel_fold") and (
-            args.sliding_window is not None):
-        raise SystemExit(f"{args.impl} runs full attention only.")
     if args.output and not args.trace and recorded(args.output, cell.key):
         print(f"{cell.key}: already recorded in {args.output}")
         return 0
