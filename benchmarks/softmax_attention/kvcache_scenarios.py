@@ -31,10 +31,11 @@ kernel. RPA v3 runs ragged_paged_attention with the request distribution
 vLLM's TPU runner sends, mixed for chunked prefill and decode for decode, and
 its own default block sizes unless --rpa-blocks names some.
 
-On verify, flywheel's flash_attn_with_kvcache sends seqlen_q > 1 to the ragged
-append plus the paged varlen kernel, which sizes its q block from the whole
-packed token count; flywheel_tq runs the same two kernels with max_seqlen_q =
---verify-tokens. rpa sends verify windows to the mixed case, as tpu-inference
+On verify, flywheel's flash_attn_with_kvcache runs a window of at most
+MAX_FOLDED_QUERY_ROWS query rows per KV head as flywheel_fold_causal does, and
+a longer one on the ragged append plus the paged varlen kernel, which sizes
+its q block from the whole packed token count; flywheel_tq runs those two
+kernels with max_seqlen_q = --verify-tokens. rpa sends verify windows to the mixed case, as tpu-inference
 does by default (max_decode_tokens is 1 without the batched kernel);
 rpa_batched runs the experimental batched RPA kernel, whose decode case takes
 them with decode_query_size = --verify-tokens (USE_BATCHED_RPA_KERNEL). With
