@@ -187,6 +187,7 @@ def kvcache_kernel(
     return_lse: bool,
     has_new: bool,
     left: int | None,
+    query_tokens: int,
     log2_softcap: float,
     guard_threshold: float,
     page_size: int | None,
@@ -289,6 +290,19 @@ def kvcache_kernel(
     pv_row_head = lax.broadcasted_iota(
         jnp.int32, (rows_per_fragment, head_dim), 0
     ) // query_heads_per_kv_head
+  # Note (david): with query_tokens > 1 a KV head's query rows are its
+  # window's tokens in order, query_heads_per_kv_head // query_tokens rows
+  # each, and window token t sees the keys below
+  # total_len - (query_tokens - 1) + t, bottom-right causal.
+  if query_tokens == 1:
+    row_key_offset = None
+  else:
+    row_key_offset = (
+        lax.broadcasted_iota(jnp.int32, (rows_per_fragment, fragment_keys), 0)
+        % query_heads_per_kv_head
+        // (query_heads_per_kv_head // query_tokens)
+        - (query_tokens - 1)
+    )
   if kv_heads_per_fragment == 1:
     parity_mask = None
   else:
@@ -779,11 +793,15 @@ def kvcache_kernel(
         key_position = key_start + lax.broadcasted_iota(
             jnp.int32, (rows_per_fragment, fragment_keys), 1
         ) // kv_heads_per_fragment
+        if row_key_offset is None:
+          key_end = total_len
+        else:
+          key_end = total_len + row_key_offset
         if left is None:
-          is_in_window = key_position < total_len
+          is_in_window = key_position < key_end
         else:
           is_in_window = (
-              (key_position < total_len) & (key_position >= first_key)
+              (key_position < key_end) & (key_position >= first_key)
           )
         if parity_mask is None:
           is_valid = is_in_window
@@ -1065,6 +1083,7 @@ def flash_attn_kvcache_pallas(
     num_active: int | jax.Array | None = None,
     merged_cache: bool = False,
     softcap: float = 0.0,
+    query_tokens: int = 1,
 ) -> tuple[jax.Array, ...]:
   """One-token cache append and decode attention for every row in one call.
 
@@ -1088,6 +1107,13 @@ def flash_attn_kvcache_pallas(
   contract); the kernel never reads their cache_seqlens, cache_batch_idx or
   block_table entries, appends nothing for them and leaves their out and lse
   rows unspecified. None means every row is active.
+
+  query_tokens > 1 folds a causal window of that many tokens, already in the
+  cache, into the query heads: query head (h * query_tokens + t) * g + j,
+  g = num_query_heads // num_kv_heads // query_tokens, is window token t of
+  head h * g + j, and sees the keys below cache_seqlens - query_tokens + 1 +
+  t. It takes has_new=False and no window; a row whose cache_seqlens is
+  below query_tokens is unspecified.
   """
   assert (v_cache is None) == merged_cache, (
       "merged_cache takes one cache operand and v_cache=None, a pair both."
@@ -1143,6 +1169,16 @@ def flash_attn_kvcache_pallas(
   if head_dim not in SUPPORTED_HEAD_DIMS:
     raise ValueError(
         f"head_dim must be one of {SUPPORTED_HEAD_DIMS}; got {head_dim}."
+    )
+  if query_tokens < 1 or num_query_heads % (num_kv_heads * query_tokens):
+    raise ValueError(
+        f"num_query_heads={num_query_heads} must be a multiple of"
+        f" num_kv_heads * query_tokens = {num_kv_heads} * {query_tokens}."
+    )
+  if query_tokens > 1 and (has_new or left is not None):
+    raise NotImplementedError(
+        "query_tokens > 1 attends a window already in the cache: it takes"
+        " has_new=False and no sliding window."
     )
   if capacity % MIN_BLOCK_KV:
     raise ValueError(
@@ -1304,6 +1340,7 @@ def flash_attn_kvcache_pallas(
       return_lse=return_lse,
       has_new=has_new,
       left=left,
+      query_tokens=query_tokens,
       log2_softcap=softcap * LOG2E,
       guard_threshold=guard_threshold,
       page_size=page_size,
