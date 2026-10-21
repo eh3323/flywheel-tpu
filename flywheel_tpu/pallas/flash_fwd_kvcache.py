@@ -187,7 +187,7 @@ def kvcache_kernel(
     return_lse: bool,
     has_new: bool,
     left: int | None,
-    query_tokens: int,
+    causal_window: int,
     log2_softcap: float,
     guard_threshold: float,
     page_size: int | None,
@@ -290,18 +290,17 @@ def kvcache_kernel(
     pv_row_head = lax.broadcasted_iota(
         jnp.int32, (rows_per_fragment, head_dim), 0
     ) // query_heads_per_kv_head
-  # Note (david): with query_tokens > 1 a KV head's query rows are its
-  # window's tokens in order, query_heads_per_kv_head // query_tokens rows
-  # each, and window token t sees the keys below
-  # total_len - (query_tokens - 1) + t, bottom-right causal.
-  if query_tokens == 1:
+  # Note (david): a folded window lays a KV head's rows out token by token, so
+  # row r is window token r // group and stops causal_window - 1 - t keys
+  # short of total_len.
+  if causal_window == 1:
     row_key_offset = None
   else:
     row_key_offset = (
         lax.broadcasted_iota(jnp.int32, (rows_per_fragment, fragment_keys), 0)
         % query_heads_per_kv_head
-        // (query_heads_per_kv_head // query_tokens)
-        - (query_tokens - 1)
+        // (query_heads_per_kv_head // causal_window)
+        - (causal_window - 1)
     )
   if kv_heads_per_fragment == 1:
     parity_mask = None
@@ -1083,13 +1082,16 @@ def flash_attn_kvcache_pallas(
     num_active: int | jax.Array | None = None,
     merged_cache: bool = False,
     softcap: float = 0.0,
-    query_tokens: int = 1,
+    causal: bool = False,
 ) -> tuple[jax.Array, ...]:
   """One-token cache append and decode attention for every row in one call.
 
   q: (batch, num_query_heads, head_dim), already scaled into log2 units, or
   by softmax_scale / softcap when softcap > 0, which applies Gemma-2's
-  tanh(s / softcap) * softcap to the scaled scores.
+  tanh(s / softcap) * softcap to the scaled scores. A (batch, window,
+  num_query_heads, head_dim) q is a window already in the cache, folded into
+  the query heads so each row's cache is read once; out and lse keep q's
+  layout, and causal bounds window token t at cache_seqlens - window + 1 + t.
   k_cache/v_cache: (rows, capacity, num_kv_heads, head_dim), or head-major
   (rows, num_kv_heads, capacity, head_dim) with cache_head_major. With
   block_table, the flat (batch * pages_per_seq,) int32 page table, the caches
@@ -1100,20 +1102,13 @@ def flash_attn_kvcache_pallas(
   (rows, capacity, 2 * num_kv_heads, head_dim) array whose token rows hold
   each KV head's K then its V, [k0, v0, k1, v1, ...] (RPA v3's head order),
   and returns (out, kv_cache[, lse]) instead of (out, k_cache, v_cache[,
-  lse]). lse is (batch, num_query_heads, 128) float32 with each value
-  broadcast over lanes.
+  lse]). lse is (batch, num_query_heads, 128) float32, (batch, window,
+  num_query_heads, 128) for a window, with each value broadcast over lanes.
 
   num_active: rows at or past it are padding (RPA's distribution[-1]
   contract); the kernel never reads their cache_seqlens, cache_batch_idx or
   block_table entries, appends nothing for them and leaves their out and lse
   rows unspecified. None means every row is active.
-
-  query_tokens > 1 folds a causal window of that many tokens, already in the
-  cache, into the query heads: query head (h * query_tokens + t) * g + j,
-  g = num_query_heads // num_kv_heads // query_tokens, is window token t of
-  head h * g + j, and sees the keys below cache_seqlens - query_tokens + 1 +
-  t. It takes has_new=False and no window; a row whose cache_seqlens is
-  below query_tokens is unspecified.
   """
   assert (v_cache is None) == merged_cache, (
       "merged_cache takes one cache operand and v_cache=None, a pair both."
@@ -1123,7 +1118,11 @@ def flash_attn_kvcache_pallas(
   ), "merged_cache takes one token-major cache with an even head axis."
   cache_operands = (k_cache,) if merged_cache else (k_cache, v_cache)
   cache_shape = k_cache.shape
-  batch, num_query_heads, head_dim = q.shape
+  is_window = q.ndim == 4
+  if is_window:
+    batch, window, window_heads, head_dim = q.shape
+  else:
+    batch, num_query_heads, head_dim = q.shape
   if merged_cache:
     # Note (david): a merged build stages, appends and writes back whole token
     # rows, so no DMA cuts the head axis, and a staged u32 word holds one
@@ -1170,16 +1169,22 @@ def flash_attn_kvcache_pallas(
     raise ValueError(
         f"head_dim must be one of {SUPPORTED_HEAD_DIMS}; got {head_dim}."
     )
-  if query_tokens < 1 or num_query_heads % (num_kv_heads * query_tokens):
-    raise ValueError(
-        f"num_query_heads={num_query_heads} must be a multiple of"
-        f" num_kv_heads * query_tokens = {num_kv_heads} * {query_tokens}."
+  if is_window:
+    assert window_heads % num_kv_heads == 0
+    assert not has_new and left is None, "a window is already in the cache"
+    # Note (david): putting window token t of query head h * group + j at
+    # folded head (h * window + t) * group + j lets KV head h's rows share
+    # one read of its keys.
+    group = window_heads // num_kv_heads
+    num_query_heads = num_kv_heads * window * group
+    q = (
+        q.reshape(batch, window, num_kv_heads, group, head_dim)
+        .transpose(0, 2, 1, 3, 4)
+        .reshape(batch, num_query_heads, head_dim)
     )
-  if query_tokens > 1 and (has_new or left is not None):
-    raise NotImplementedError(
-        "query_tokens > 1 attends a window already in the cache: it takes"
-        " has_new=False and no sliding window."
-    )
+    causal_window = window if causal else 1
+  else:
+    causal_window = 1
   if capacity % MIN_BLOCK_KV:
     raise ValueError(
         f"capacity must be a multiple of {MIN_BLOCK_KV}; got {capacity}."
@@ -1340,7 +1345,7 @@ def flash_attn_kvcache_pallas(
       return_lse=return_lse,
       has_new=has_new,
       left=left,
-      query_tokens=query_tokens,
+      causal_window=causal_window,
       log2_softcap=softcap * LOG2E,
       guard_threshold=guard_threshold,
       page_size=page_size,
@@ -1369,16 +1374,30 @@ def flash_attn_kvcache_pallas(
       interpret=pltpu.InterpretParams() if interpret else False,
   )
   kernel_outputs = call(*scalar_prefetches, *dense_inputs, *kernel_caches)
+  num_caches = len(cache_operands)
   if is_token_major_mqa:
-    num_caches = len(cache_operands)
-    restored_caches = tuple(
+    caches_out = tuple(
         out_cache.reshape(operand.shape)
         for out_cache, operand in zip(
             kernel_outputs[1:1 + num_caches], cache_operands
         )
     )
-    return (
-        kernel_outputs[0], *restored_caches, *kernel_outputs[1 + num_caches:]
+  else:
+    caches_out = tuple(kernel_outputs[1:1 + num_caches])
+  if is_window:
+    out = (
+        kernel_outputs[0]
+        .reshape(batch, num_kv_heads, window, group, head_dim)
+        .transpose(0, 2, 1, 3, 4)
+        .reshape(batch, window, window_heads, head_dim)
+    )
+    lse_out = tuple(
+        lse.reshape(batch, num_kv_heads, window, group, NUM_LANES)
+        .transpose(0, 2, 1, 3, 4)
+        .reshape(batch, window, window_heads, NUM_LANES)
+        for lse in kernel_outputs[1 + num_caches:]
     )
   else:
-    return kernel_outputs
+    out = kernel_outputs[0]
+    lse_out = tuple(kernel_outputs[1 + num_caches:])
+  return (out, *caches_out, *lse_out)

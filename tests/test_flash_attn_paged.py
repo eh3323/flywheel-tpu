@@ -362,53 +362,43 @@ def test_ragged_cache_prefill_gqa_regression():
   assert_extend_matches(actual, expected, case[5], case[6])
 
 
-def run_window(q, kc, vc, k, v, lengths, table, *, seqlen_q, **kwargs):
-  """flash_attn_with_kvcache's (batch, seqlen_q, heads, head_dim) call on the
-  merged pool, from packed rows; returns (out, lse, updated_k, updated_v)
-  packed back, as run_extend does, and the call's jaxpr."""
-  batch, heads = table.shape[0], q.shape[1]
-
-  def window(rows):
-    return None if rows is None else rows.reshape(
-        batch, seqlen_q, *rows.shape[1:])
-
-  def call(kv_cache):
-    return flash_attn_with_kvcache(
-        window(q), kv_cache, None, window(k), window(v), block_table=table,
-        cache_seqlens=lengths, return_softmax_lse=True, interpret=INTERPRET,
-        **kwargs)
-
-  out, lse, kv_cache = call(interleave(kc, vc))
-  return ((out.reshape(q.shape), lse.transpose(1, 0, 2).reshape(heads, -1),
-           *deinterleave(kv_cache)),
-          str(jax.make_jaxpr(call)(interleave(kc, vc))))
-
-
 @pytest.mark.parametrize("append", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("heads,kv_heads,seqlen_q",
                          [(32, 8, 4), (32, 8, 16), (8, 1, 16), (6, 3, 3)])
 def test_verify_window_on_the_decode_kernel(heads, kv_heads, seqlen_q, causal,
                                             append):
-  # Note (david): a window of at most MAX_FOLDED_QUERY_ROWS query rows per KV
-  # head runs the decode kernel with the window folded into the query heads,
-  # not the paged varlen kernel. The windows start or end at page edges or
-  # cross them, and the last request is past num_active: its rows are out = 0
-  # and lse = -inf, and it appends nothing.
+  # Note (david): the prefixes put windows on, before and across page edges,
+  # and the last request is past num_active, so its rows must come back out =
+  # 0 and lse = -inf with nothing appended.
   q, kc, vc, k, v, cu, lengths, table = random_ragged_case(
       lengths=(seqlen_q,) * 4, prefixes=(128, 256 - seqlen_q + 1, 127, 200),
       heads=heads, kv_heads=kv_heads, padding=0)
-  k, v = (k, v) if append else (None, None)
+  batch = table.shape[0]
   num_active = 3
   active_rows = num_active * seqlen_q
+  if append:
+    reference_k, reference_v = k[:active_rows], v[:active_rows]
+    window_k, window_v = (
+        rows.reshape(batch, seqlen_q, *rows.shape[1:]) for rows in (k, v))
+  else:
+    reference_k = reference_v = window_k = window_v = None
   expected = ragged_reference(
-      q[:active_rows], kc, vc, None if k is None else k[:active_rows],
-      None if v is None else v[:active_rows], cu[:num_active + 1],
+      q[:active_rows], kc, vc, reference_k, reference_v, cu[:num_active + 1],
       lengths[:num_active], table, causal=causal)
-  actual, jaxpr = run_window(q, kc, vc, k, v, lengths, table,
-                             seqlen_q=seqlen_q, causal=causal,
-                             num_active=num_active)
+
+  def _window_attention(kv_cache):
+    return flash_attn_with_kvcache(
+        q.reshape(batch, seqlen_q, *q.shape[1:]), kv_cache, None, window_k,
+        window_v, block_table=table, cache_seqlens=lengths,
+        num_active=num_active, causal=causal, return_softmax_lse=True,
+        interpret=INTERPRET)
+
+  jaxpr = str(jax.make_jaxpr(_window_attention)(interleave(kc, vc)))
   assert "flash_attn_varlen_paged_fwd" not in jaxpr
+  out, lse, kv_cache = _window_attention(interleave(kc, vc))
+  actual = (out.reshape(q.shape), lse.transpose(1, 0, 2).reshape(heads, -1),
+            *deinterleave(kv_cache))
   assert_extend_matches(actual, expected, cu[:num_active + 1],
                         lengths[:num_active])
 
