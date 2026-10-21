@@ -187,7 +187,8 @@ def kvcache_kernel(
     return_lse: bool,
     has_new: bool,
     left: int | None,
-    causal_window: int,
+    query_tokens: int,
+    causal: bool,
     log2_softcap: float,
     guard_threshold: float,
     page_size: int | None,
@@ -291,17 +292,17 @@ def kvcache_kernel(
         jnp.int32, (rows_per_fragment, head_dim), 0
     ) // query_heads_per_kv_head
   # Note (david): a folded window lays a KV head's rows out token by token, so
-  # row r is window token r // group and stops causal_window - 1 - t keys
-  # short of total_len.
-  if causal_window == 1:
-    row_key_offset = None
-  else:
+  # row r is window token t = r // group, which causal stops
+  # query_tokens - 1 - t keys short of total_len.
+  if causal and query_tokens > 1:
     row_key_offset = (
         lax.broadcasted_iota(jnp.int32, (rows_per_fragment, fragment_keys), 0)
         % query_heads_per_kv_head
-        // (query_heads_per_kv_head // causal_window)
-        - (causal_window - 1)
+        // (query_heads_per_kv_head // query_tokens)
+        - (query_tokens - 1)
     )
+  else:
+    row_key_offset = None
   if kv_heads_per_fragment == 1:
     parity_mask = None
   else:
@@ -1120,9 +1121,10 @@ def flash_attn_kvcache_pallas(
   cache_shape = k_cache.shape
   is_window = q.ndim == 4
   if is_window:
-    batch, window, window_heads, head_dim = q.shape
+    batch, query_tokens, window_heads, head_dim = q.shape
   else:
     batch, num_query_heads, head_dim = q.shape
+    query_tokens = 1
   if merged_cache:
     # Note (david): a merged build stages, appends and writes back whole token
     # rows, so no DMA cuts the head axis, and a staged u32 word holds one
@@ -1173,18 +1175,15 @@ def flash_attn_kvcache_pallas(
     assert window_heads % num_kv_heads == 0
     assert not has_new and left is None, "a window is already in the cache"
     # Note (david): putting window token t of query head h * group + j at
-    # folded head (h * window + t) * group + j lets KV head h's rows share
-    # one read of its keys.
+    # folded head (h * query_tokens + t) * group + j lets KV head h's rows
+    # share one read of its keys.
     group = window_heads // num_kv_heads
-    num_query_heads = num_kv_heads * window * group
+    num_query_heads = num_kv_heads * query_tokens * group
     q = (
-        q.reshape(batch, window, num_kv_heads, group, head_dim)
+        q.reshape(batch, query_tokens, num_kv_heads, group, head_dim)
         .transpose(0, 2, 1, 3, 4)
         .reshape(batch, num_query_heads, head_dim)
     )
-    causal_window = window if causal else 1
-  else:
-    causal_window = 1
   if capacity % MIN_BLOCK_KV:
     raise ValueError(
         f"capacity must be a multiple of {MIN_BLOCK_KV}; got {capacity}."
@@ -1345,7 +1344,8 @@ def flash_attn_kvcache_pallas(
       return_lse=return_lse,
       has_new=has_new,
       left=left,
-      causal_window=causal_window,
+      query_tokens=query_tokens,
+      causal=causal,
       log2_softcap=softcap * LOG2E,
       guard_threshold=guard_threshold,
       page_size=page_size,
@@ -1387,14 +1387,14 @@ def flash_attn_kvcache_pallas(
   if is_window:
     out = (
         kernel_outputs[0]
-        .reshape(batch, num_kv_heads, window, group, head_dim)
+        .reshape(batch, num_kv_heads, query_tokens, group, head_dim)
         .transpose(0, 2, 1, 3, 4)
-        .reshape(batch, window, window_heads, head_dim)
+        .reshape(batch, query_tokens, window_heads, head_dim)
     )
     lse_out = tuple(
-        lse.reshape(batch, num_kv_heads, window, group, NUM_LANES)
+        lse.reshape(batch, num_kv_heads, query_tokens, group, NUM_LANES)
         .transpose(0, 2, 1, 3, 4)
-        .reshape(batch, window, window_heads, NUM_LANES)
+        .reshape(batch, query_tokens, window_heads, NUM_LANES)
         for lse in kernel_outputs[1 + num_caches:]
     )
   else:
