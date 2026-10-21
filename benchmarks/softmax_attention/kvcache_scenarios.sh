@@ -19,7 +19,7 @@
 #                     empty runs RPA's own formula
 #     SCENARIOS       default "chunked_prefill decode"; add verify for the
 #                     verify sweep below
-#     VERIFY_IMPLS    default "flywheel flywheel_tq rpa rpa_batched"; flywheel_fold
+#     VERIFY_IMPLS    default "flywheel flywheel_tq rpa"; flywheel_fold
 #                     (non-causal, on the decode kernel) and
 #                     flywheel_fold_causal run on request
 #     VERIFY_HEADS    "heads heads_k head_dim" (default "32 8 128", Qwen3-4B)
@@ -43,7 +43,7 @@ DECODE_BATCHES=${DECODE_BATCHES-"256 128"}
 # compiles RPA's mixed kernel as well, so it needs these blocks there too.
 RPA_K32_BLOCKS=${RPA_K32_BLOCKS-"128,256,128,256"}
 SCENARIOS=${SCENARIOS:-"chunked_prefill decode"}
-VERIFY_IMPLS=${VERIFY_IMPLS:-"flywheel flywheel_tq rpa rpa_batched"}
+VERIFY_IMPLS=${VERIFY_IMPLS:-"flywheel flywheel_tq rpa"}
 VERIFY_HEADS=${VERIFY_HEADS:-"32 8 128"}
 VERIFY_BATCHES=${VERIFY_BATCHES:-"32 128"}
 VERIFY_SEQS=${VERIFY_SEQS:-"2048 8192"}

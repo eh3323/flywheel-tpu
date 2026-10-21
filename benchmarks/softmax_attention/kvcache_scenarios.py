@@ -35,10 +35,8 @@ On verify, flywheel's flash_attn_with_kvcache runs a window of at most
 MAX_FOLDED_QUERY_ROWS query rows per KV head as flywheel_fold_causal does, and
 a longer one on the ragged append plus the paged varlen kernel, which sizes
 its q block from the whole packed token count; flywheel_tq runs those two
-kernels with max_seqlen_q = --verify-tokens. rpa sends verify windows to the mixed case, as tpu-inference
-does by default (max_decode_tokens is 1 without the batched kernel);
-rpa_batched runs the experimental batched RPA kernel, whose decode case takes
-them with decode_query_size = --verify-tokens (USE_BATCHED_RPA_KERNEL). With
+kernels with max_seqlen_q = --verify-tokens. rpa sends verify windows to the
+mixed case, as tpu-inference does (max_decode_tokens is 1). With
 --verify-tokens 1 every impl but flywheel_tq runs its decode path.
 flywheel_fold runs the ragged append, then flywheel's decode kernel with the
 window folded into the GQA group: one query token per sequence carrying
@@ -67,7 +65,6 @@ import numpy as np
 from benchmarks.common.records import recorded, write_record
 from benchmarks.common.rpa import (
     DEFAULT_RPA_SOURCE,
-    load_batched_rpa,
     load_rpa_v3,
     request_distribution,
     unjitted_kernel,
@@ -76,7 +73,7 @@ from benchmarks.common.timing import time_call
 from benchmarks.softmax_attention import segments as segments_lib
 
 IMPLS = ("flywheel", "flywheel_tq", "flywheel_fold", "flywheel_fold_causal",
-         "rpa", "rpa_batched")
+         "rpa")
 SCENARIOS = ("chunked_prefill", "decode", "verify")
 KERNEL_MARKERS = ("flash_attn", "RPA", "ragged_paged", "rpa_metadata")
 
@@ -405,46 +402,6 @@ def build_flywheel_fold(cell, inputs, args):
     return step, (lambda: fill_cache(shape, cell.dtype, generator)), {}
 
 
-def build_rpa_batched(cell, inputs, args):
-    """(step, fresh_state, info) running the experimental batched RPA kernel
-    with every sequence in its decode case."""
-    import jax
-    import jax.numpy as jnp
-
-    wrapper = load_batched_rpa(args.rpa_source)
-    calls, block_table, starts = inputs
-    shape = wrapper.get_kv_cache_shape(
-        cell.num_seqs * block_table.shape[1], cell.page_size, cell.heads_k,
-        cell.head_dim, jnp.dtype(cell.dtype))
-    page_indices = block_table.reshape(-1)
-    cu_q_lens = (jnp.arange(cell.batch + 1, dtype=jnp.int32)
-                 * cell.verify_tokens)
-    distribution = request_distribution(
-        num_decode=cell.batch, num_seqs=cell.batch)
-    kernel_fn = unjitted_kernel(wrapper)
-    scale = 1.0 / math.sqrt(cell.head_dim)
-
-    def call(cache, q, k, v, start):
-        out, cache = kernel_fn(
-            q, k, v, cache, start + cell.verify_tokens, page_indices,
-            cu_q_lens, distribution, sm_scale=scale,
-            sliding_window=cell.sliding_window,
-            decode_query_size=cell.verify_tokens)
-        return out, cache
-
-    kernel = jax.jit(call, donate_argnums=(0,))
-
-    def step(cache):
-        out = None
-        for (q, k, v), start in zip(calls, starts):
-            out, cache = kernel(cache, q, k, v, start)
-        return out, cache
-
-    generator = np.random.default_rng(1)
-    return step, (lambda: fill_cache(shape, cell.dtype, generator)), {
-        "block_source": "batched rpa tuned_params"}
-
-
 def build_rpa(cell, inputs, args):
     """(step, fresh_state, info) running ragged_paged_attention."""
     import jax
@@ -463,8 +420,8 @@ def build_rpa(cell, inputs, args):
         blocks_arg = "m_block_sizes"
     elif cell.scenario == "verify" and cell.verify_tokens > 1:
         # Note (david): tpu-inference's runner counts a request as decode only
-        # at num_scheduled_tokens <= max_decode_tokens, which is 1 without
-        # the batched kernel, so a verify window is mixed.
+        # at num_scheduled_tokens <= max_decode_tokens, which is 1, so a
+        # verify window is mixed.
         cu_q_lens = (jnp.arange(cell.batch + 1, dtype=jnp.int32)
                      * cell.verify_tokens)
         distribution = request_distribution(
@@ -514,8 +471,7 @@ def build_rpa(cell, inputs, args):
 
 BUILDERS = {"flywheel": build_flywheel, "flywheel_tq": build_flywheel_tq,
             "flywheel_fold": build_flywheel_fold,
-            "flywheel_fold_causal": build_flywheel_fold, "rpa": build_rpa,
-            "rpa_batched": build_rpa_batched}
+            "flywheel_fold_causal": build_flywheel_fold, "rpa": build_rpa}
 
 
 def trace_scenario(cell, step, state, directory):
@@ -622,7 +578,7 @@ def main(argv=None):
     if args.impl == "flywheel_tq" and (
             args.scenario != "verify" or args.verify_tokens < 2):
         raise SystemExit("flywheel_tq runs verify with --verify-tokens >= 2.")
-    if args.impl in ("rpa_batched", "flywheel_fold",
+    if args.impl in ("flywheel_fold",
                      "flywheel_fold_causal") and args.scenario != "verify":
         raise SystemExit(f"{args.impl} runs the verify scenario only.")
     if args.impl.startswith("flywheel_fold") and (
