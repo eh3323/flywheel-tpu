@@ -8,10 +8,93 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from .block_sizes import NUM_LANES, QKVLayout, TokenMajorInfo
+from .block_sizes import NUM_LANES, QKVLayout, TokenMajorInfo, round_up
 
 MIN_BLOCK_KV = 128
 BF16_BITS = 16
+FP8_BITS = 8
+KV_WORD_BYTES = 4
+MERGED_KV_DTYPES = (
+    jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float8_e4m3fn),
+    jnp.dtype(jnp.float8_e5m2))
+
+# Note (david): a merged-cache token keeps each KV head's K and V in one u32
+# word per lane, so one load yields both. A bf16 word is one head's (K, V),
+# rows [k0, v0, k1, v1, ...]; an fp8 word is a head pair's (K, K, V, V), rows
+# [k0, k1, v0, v1, ...], the bf16 interleave at 16-bit granularity, so the
+# fp8 pack needs no cross-sublane shuffle. An odd fp8 head count pads one zero
+# head.
+
+
+def check_merged_kv_dtype(dtype: jnp.dtype) -> None:
+  if jnp.dtype(dtype) not in MERGED_KV_DTYPES:
+    raise NotImplementedError(
+        "the merged KV cache holds bfloat16, float8_e4m3fn or float8_e5m2;"
+        f" got {jnp.dtype(dtype)}.")
+
+
+def kv_word_rows(dtype: jnp.dtype) -> int:
+  """Merged-cache head rows one u32 word per lane holds: 2 for bf16, 4 for
+  fp8."""
+  return KV_WORD_BYTES // jnp.dtype(dtype).itemsize
+
+
+def kv_heads_per_word(dtype: jnp.dtype) -> int:
+  return kv_word_rows(dtype) // 2
+
+
+def merged_cache_heads(num_kv_heads: int, dtype: jnp.dtype) -> int:
+  """Head rows of one merged-cache token: 2 * num_kv_heads, padded to whole
+  u32 words."""
+  return 2 * round_up(num_kv_heads, kv_heads_per_word(dtype))
+
+
+def resolve_merged_kv_heads(
+    cache_heads: int, dtype: jnp.dtype, nheads_k: int | None
+) -> int:
+  """KV heads of a merged cache whose tokens hold cache_heads head rows:
+  nheads_k, else half the rows of a bf16 cache. Checks the dtype and that
+  cache_heads is that head count's merged_cache_heads."""
+  check_merged_kv_dtype(dtype)
+  if nheads_k is not None:
+    num_kv_heads = nheads_k
+  elif kv_heads_per_word(dtype) > 1:
+    raise ValueError(
+        "an fp8 cache pads an odd nheads_k, so its head axis does not give"
+        " the KV head count; pass nheads_k.")
+  else:
+    num_kv_heads = cache_heads // 2
+  if merged_cache_heads(num_kv_heads, dtype) != cache_heads:
+    raise ValueError(
+        f"a merged {jnp.dtype(dtype)} cache of {num_kv_heads} KV heads holds"
+        f" {merged_cache_heads(num_kv_heads, dtype)} head rows per token; got"
+        f" {cache_heads}.")
+  return num_kv_heads
+
+
+def interleave_kv_rows(k_rows: jax.Array, v_rows: jax.Array) -> jax.Array:
+  """(..., heads, head_dim) K and V rows -> (..., 2 * heads, head_dim) merged
+  cache rows; an fp8 operand needs an even head count."""
+  # Note (david): the halves move as integers, so every bit pattern (NaN
+  # payloads, subnormals) survives; an fp8 pair packs into the 16-bit half.
+  k_bits = pltpu.bitcast(k_rows, jnp.uint16).astype(jnp.uint32)
+  v_bits = pltpu.bitcast(v_rows, jnp.uint16).astype(jnp.uint32)
+  return pltpu.bitcast(k_bits | (v_bits << BF16_BITS), k_rows.dtype)
+
+
+def kv_word_halves(
+    words: jax.Array, kv_head: jax.Array | int, dtype: jnp.dtype
+) -> tuple[jax.Array, jax.Array]:
+  """(keys, values) of kv_head from its (rows, head_dim) u32 merged words."""
+  if jnp.dtype(dtype) == jnp.bfloat16:
+    keys, values = bf16_half(words, 0), bf16_half(words, 1)
+  else:
+    head_in_word = jnp.asarray(kv_head % kv_heads_per_word(dtype), jnp.uint32)
+    key_shift = head_in_word * jnp.uint32(FP8_BITS)
+    key_bits = words >> key_shift
+    keys = pltpu.bitcast(key_bits.astype(jnp.uint8), dtype)
+    values = pltpu.bitcast((key_bits >> BF16_BITS).astype(jnp.uint8), dtype)
+  return keys, values
 
 
 def advance(

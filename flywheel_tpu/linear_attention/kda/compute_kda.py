@@ -30,6 +30,8 @@ L2_NORM_EPS = 1e-6
 BASE_BLOCK_SIZE = 4
 BLOCKS_PER_LEVEL = 4
 NUM_STATE_PHASES = 3
+HALF_WORD_BITS = 16
+LOW_HALF_MASK = (1 << HALF_WORD_BITS) - 1
 
 
 def profile_scope(name: str) -> contextlib.AbstractContextManager[None]:
@@ -1071,17 +1073,66 @@ def recurrent_kda(
     return jnp.stack(seq_outs, axis=0), jnp.stack(seq_states, axis=0)
 
 
+def split_checkpoint_planes(state: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """The hi and lo planes [..., kq_head_dim // 2, v_head_dim] int32 of an f32
+    checkpoint [..., kq_head_dim, v_head_dim].
+
+    hi holds each value's bf16, rounded half up on its bit pattern, and lo its
+    low 16 bits. A word holds row i in its low half and row
+    i + kq_head_dim / 2 in its high half.
+    """
+
+    def _pack_rows(halves):
+        num_rows = halves.shape[-2] // 2
+        return (halves[..., :num_rows, :] |
+                (halves[..., num_rows:, :] << HALF_WORD_BITS))
+
+    # Note (david): only integer ops and same-width bitcasts touch the bits,
+    # so no float op can flush a subnormal or quiet a NaN. Round half up
+    # leaves exactly 2^16 bit patterns per hi value (round to nearest even
+    # leaves 2^16 + 1 per even one), so hi and lo give the f32 back; a carry
+    # into the exponent is correct rounding.
+    bits = jax.lax.bitcast_convert_type(state, jnp.int32)
+    hi_rounding_bias = 1 << (HALF_WORD_BITS - 1)
+    hi_halves = jax.lax.shift_right_logical(bits + hi_rounding_bias,
+                                            jnp.int32(HALF_WORD_BITS))
+    return _pack_rows(hi_halves), _pack_rows(bits & LOW_HALF_MASK)
+
+
+def merge_checkpoint_planes(hi_words: jax.Array,
+                            lo_words: jax.Array) -> jax.Array:
+    """The f32 checkpoint whose planes split_checkpoint_planes made, bit for
+    bit."""
+
+    def _unpack_rows(hi_bits, lo_bits):
+        # Note (david): hi was rounded up exactly when lo has its top bit set.
+        upper_bits = hi_bits - jax.lax.shift_right_logical(
+            lo_bits, jnp.int32(HALF_WORD_BITS - 1))
+        return (upper_bits << HALF_WORD_BITS) | lo_bits
+
+    half_shift = jnp.int32(HALF_WORD_BITS)
+    rows = jnp.concatenate([
+        _unpack_rows(hi_words & LOW_HALF_MASK, lo_words & LOW_HALF_MASK),
+        _unpack_rows(jax.lax.shift_right_logical(hi_words, half_shift),
+                     jax.lax.shift_right_logical(lo_words, half_shift)),
+    ], axis=-2)
+    return jax.lax.bitcast_convert_type(rows, jnp.float32)
+
+
 def replay_record_parts(
-        records: jax.Array, num_records: jax.Array,
+        records: jax.Array, gates: jax.Array, num_records: jax.Array,
         cfg: config.KDAConfig) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Split a [replay_window, record_dim] record buffer into u [num_v_heads,
-    rows, v_head_dim], k [num_kq_heads, rows, kq_head_dim] and g
-    [num_v_heads, rows, kq_head_dim]; rows from num_records on are zero."""
+    rows, v_head_dim] and k [num_kq_heads, rows, kq_head_dim], and its
+    [replay_window, gate_dim] gates into g [num_v_heads, rows, kq_head_dim];
+    rows from num_records on are zero."""
     d_k, d_v = cfg.kq_head_dim, cfg.v_head_dim
     # Note (david): rows past num_records may hold NaN from stale VMEM, so they
     # are selected away, not scaled: 0 * NaN is NaN.
     record_row = jax.lax.broadcasted_iota(jnp.int32, records.shape, 0)
     records = jnp.where(record_row < num_records, records, 0)
+    gate_record_row = jax.lax.broadcasted_iota(jnp.int32, gates.shape, 0)
+    gates = jnp.where(gate_record_row < num_records, gates, 0)
     u_records = jnp.stack([
         records[:, head * d_v:(head + 1) * d_v]
         for head in range(cfg.num_v_heads)
@@ -1092,8 +1143,7 @@ def replay_record_parts(
         for head in range(cfg.num_kq_heads)
     ])
     g_records = jnp.stack([
-        records[:, cfg.record_g_offset + head * d_k:
-                cfg.record_g_offset + (head + 1) * d_k]
+        gates[:, head * d_k:(head + 1) * d_k]
         for head in range(cfg.num_v_heads)
     ])
     return u_records, k_records, g_records
@@ -1108,11 +1158,12 @@ def replay_kda(
     num_tokens: jax.Array,
     num_records: jax.Array,
     records: jax.Array,
-    shadow_ref: jax.Ref,
+    gates: jax.Array,
+    checkpoint_hi_ref: jax.Ref,
     a_log: jax.Array,
     dt_bias: jax.Array,
     cfg: config.KDAConfig,
-) -> tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """One ReplaySSM step of one sequence: outputs and new records, no state.
 
     With G the per-key-channel cumulative log decay over the committed
@@ -1122,10 +1173,11 @@ def replay_kda(
 
     exp(G_t - G_j) splits at the records' end E into exp(G_t - G_E) *
     exp(G_E - G_j), both at most 1, so the decays fold into the new tokens'
-    k / q and the records' k; S, the bf16 shadow in shadow_ref, then enters
-    only through [k; q] @ S. Rows from num_tokens on are padding. Returns the
-    packed output [window, num_v_heads * v_head_dim] and the new records
-    [window, record_dim].
+    k / q and the records' k; S, as the bf16 of the checkpoint's hi plane in
+    checkpoint_hi_ref, then enters only through [k; q] @ S. Rows from
+    num_tokens on are padding. Returns the packed output [window,
+    num_v_heads * v_head_dim], the new records [window, record_dim] and their
+    gates [window, gate_dim].
     """
     window = cfg.window_size
     num_v_heads = cfg.num_v_heads
@@ -1148,7 +1200,7 @@ def replay_kda(
                   dt_bias.astype(compute), cfg.lower_bound), 0)
 
     u_records, k_records, g_records = replay_record_parts(
-        records, num_records, cfg)
+        records, gates, num_records, cfg)
 
     q = l2_norm(q) * d_k**-0.5
     k = l2_norm(k)
@@ -1170,12 +1222,18 @@ def replay_kda(
                                  axis=1)
 
     with profile_scope("replay_ckpt_read"):
+        ckpt_query = (kq_decayed *
+                      jnp.exp(g_records_total)).astype(jnp.bfloat16)
         # Note (david): a default-precision f32 dot rounds both operands to
-        # bf16 (round to nearest), so this dot on the bf16 shadow is bitwise
-        # the one on the f32 checkpoint (v6e).
-        ckpt_reads = batched_matmul(
-            (kq_decayed * jnp.exp(g_records_total)).astype(jnp.bfloat16),
-            shadow_ref[...])
+        # bf16 anyway (v6e), so S is read as the bf16 of its hi plane. A hi
+        # value in the high half of an f32 word is exactly a bf16, so the cast
+        # only repacks it (a subnormal flushes to zero, as in any dot operand).
+        hi_words = checkpoint_hi_ref[...]
+        checkpoint_bf16 = jax.lax.bitcast_convert_type(
+            jnp.concatenate(
+                [hi_words << HALF_WORD_BITS, hi_words & ~LOW_HALF_MASK],
+                axis=-2), jnp.float32).astype(jnp.bfloat16)
+        ckpt_reads = batched_matmul(ckpt_query, checkpoint_bf16)
 
     with profile_scope("replay_record_read"):
         record_coeffs = jax.lax.dot_general(
@@ -1222,27 +1280,30 @@ def replay_kda(
 
     new_records = jnp.concatenate(
         [u[head] for head in range(num_v_heads)] +
-        [k[head] for head in range(cfg.num_kq_heads)] +
-        [g[head] for head in range(num_v_heads)], axis=-1)
+        [k[head] for head in range(cfg.num_kq_heads)], axis=-1)
+    new_gates = jnp.concatenate([g[head] for head in range(num_v_heads)],
+                                axis=-1)
 
-    return pack_out(out, cfg), new_records
+    return pack_out(out, cfg), new_records, new_gates
 
 
 def replay_flush(
     records: jax.Array,
+    gates: jax.Array,
     num_records: jax.Array,
-    checkpoint_ref: jax.Ref,
-    wait_checkpoint: Callable[[], None],
+    checkpoint_hi_ref: jax.Ref,
+    checkpoint_lo_ref: jax.Ref,
+    wait_checkpoint_lo: Callable[[], None],
     cfg: config.KDAConfig,
 ) -> jax.Array:
-    """Fold one sequence's first num_records records into its f32 checkpoint
-    and return the new checkpoint.
+    """Fold one sequence's first num_records records into its f32 checkpoint,
+    rebuilt from its hi and lo planes, and return the new checkpoint.
 
-    wait_checkpoint runs right before checkpoint_ref is read, so the caller
-    can wait for its DMA there.
+    wait_checkpoint_lo runs right before checkpoint_lo_ref is read, so the
+    caller can wait for its DMA there.
     """
     u_records, k_records, g_records = replay_record_parts(
-        records, num_records, cfg)
+        records, gates, num_records, cfg)
     # Note (david): the fold is the only place record error enters the
     # recurrence, and it runs once per flush, so it pays for f32 precision.
     with profile_scope("replay_flush"):
@@ -1256,6 +1317,7 @@ def replay_flush(
                                 precision=jax.lax.Precision.HIGHEST)
         decay_total = fused_transpose_broadcast(
             jnp.exp(g_records_total), src_dim=2, dst_dim=1)
-        wait_checkpoint()
-        return (checkpoint_ref[...].astype(cfg.dtypes.compute) * decay_total +
-                update)
+        wait_checkpoint_lo()
+        checkpoint = merge_checkpoint_planes(checkpoint_hi_ref[...],
+                                             checkpoint_lo_ref[...])
+        return checkpoint.astype(cfg.dtypes.compute) * decay_total + update

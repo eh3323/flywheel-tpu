@@ -23,7 +23,9 @@ from tests.test_util import (
     attention_ref,
     generate_qkv,
     generate_random_padding_mask,
+    merge_kv_heads,
     randn,
+    split_kv_heads,
 )
 
 INTERPRET = jax.default_backend() != "tpu"
@@ -429,31 +431,34 @@ def gather_paged_cache(cache_paged, page_table):
     )
 
 
-def interleave_kv(k_cache_paged, v_cache_paged):
-    """The paged cache flash_attn_with_kvcache takes: one merged (num_blocks, page_size,
-    2 * nheads_k, d) pool whose token rows hold each KV head's K then its V."""
-    *leading, nheads_k, d = k_cache_paged.shape
-    return jnp.stack([k_cache_paged, v_cache_paged], axis=-2).reshape(*leading, 2 * nheads_k, d)
+KV_DTYPES = [jnp.bfloat16, jnp.float8_e4m3fn, jnp.float8_e5m2]
+# Note (david): power-of-two descales keep every dequantized fp8 value exact in bf16, so
+# the bf16 reference sees the very K and V the kernel feeds the MXU.
+FP8_K_DESCALE, FP8_V_DESCALE = 2.0**-3, 2.0**-2
 
 
 def kvcache_cases(seqlens):
-    """(seqlen_q, seqlen_k, page_size, has_batch_idx, varlen_q, mha_type) the TPU caches
-    support.
+    """(seqlen_q, seqlen_k, page_size, has_batch_idx, varlen_q, mha_type, kv_dtype) the
+    TPU caches support.
 
     The contiguous cache (page_size None) serves single-token decode only and packs two
     bf16 KV heads per u32 lane, so gqa's 3 KV heads need the paged cache; a paged
-    cache's block_table maps the rows, so cache_batch_idx is contiguous-only.
+    cache's block_table maps the rows, so cache_batch_idx is contiguous-only. Only the
+    paged pool takes an fp8 cache.
     """
     cases = []
-    for (seqlen_q, seqlen_k), page_size, has_batch_idx, varlen_q, mha_type in itertools.product(
-        seqlens, [None, 128, 256], [False, True], [False, True], ["mha", "mqa", "gqa"]
+    for (seqlen_q, seqlen_k), *case in itertools.product(
+        seqlens, [None, 128, 256], [False, True], [False, True], ["mha", "mqa", "gqa"], KV_DTYPES
     ):
+        page_size, has_batch_idx, varlen_q, mha_type, kv_dtype = case
         if page_size is None:
-            supported = seqlen_q == 1 and not varlen_q and mha_type != "gqa"
+            supported = (
+                seqlen_q == 1 and not varlen_q and mha_type != "gqa" and kv_dtype == jnp.bfloat16
+            )
         else:
             supported = seqlen_k % page_size == 0 and not has_batch_idx
         if supported:
-            cases.append((seqlen_q, seqlen_k, page_size, has_batch_idx, varlen_q, mha_type))
+            cases.append((seqlen_q, seqlen_k, *case))
     return on_backend(cases)
 
 
@@ -465,7 +470,7 @@ def kvcache_cases(seqlens):
 # Note (david): every cache layout holds whole 128-token tiles, so the capacities
 # are multiples of 128; cache_seqlens draws unaligned lengths.
 @pytest.mark.parametrize(
-    "seqlen_q,seqlen_k,page_size,has_batch_idx,varlen_q,mha_type",
+    "seqlen_q,seqlen_k,page_size,has_batch_idx,varlen_q,mha_type,kv_dtype",
     kvcache_cases([
         (1, 128),
         (3, 1024),
@@ -487,9 +492,26 @@ def test_flash_attn_kvcache(
     local,
     new_kv,
     mha_type,
+    kv_dtype,
     dtype,
 ):
     rng = np.random.default_rng(0)
+    if kv_dtype == jnp.bfloat16:
+        k_descale, v_descale = 1.0, 1.0
+    else:
+        k_descale, v_descale = FP8_K_DESCALE, FP8_V_DESCALE
+
+    def quantize(x, descale):
+        """The stored form of K or V: x / descale cast to the cache dtype."""
+        return (x.astype(jnp.float32) / descale).astype(kv_dtype)
+
+    def dequantize(x, descale):
+        return (x.astype(jnp.float32) * descale).astype(dtype)
+
+    def cache_rows(pages, descale):
+        """Each batch row's dequantized (seqlen_k, ...) view of a paged pool."""
+        return gather_paged_cache(dequantize(pages, descale), page_table)[:, :seqlen_k]
+
     batch_size = 5
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
     nheads = 6
@@ -516,14 +538,17 @@ def test_flash_attn_kvcache(
     # and varlen k / v follow q's packing.
     seqlen_new = seqlen_q
     if new_kv:
-        k = randn(rng, (batch_size, seqlen_new, nheads_k, d), dtype)
-        v = randn(rng, (batch_size, seqlen_new, nheads_k, dv), dtype)
+        # Note (david): an fp8 pool takes appends already quantized; k / v below are the
+        # dequantized values the reference attends.
+        k_stored = quantize(randn(rng, (batch_size, seqlen_new, nheads_k, d), dtype), k_descale)
+        v_stored = quantize(randn(rng, (batch_size, seqlen_new, nheads_k, dv), dtype), v_descale)
+        k, v = dequantize(k_stored, k_descale), dequantize(v_stored, v_descale)
         if varlen_q:
             key_new_padding_mask = query_padding_mask
-            k_unpad, indices_k, *rest = unpad_input(k, key_new_padding_mask)
-            v_unpad, *rest = unpad_input(v, key_new_padding_mask)
+            k_unpad, indices_k, *rest = unpad_input(k_stored, key_new_padding_mask)
+            v_unpad, *rest = unpad_input(v_stored, key_new_padding_mask)
         else:
-            k_unpad, v_unpad = k, v
+            k_unpad, v_unpad = k_stored, v_stored
     else:
         k, v, k_unpad, v_unpad = None, None, None, None
     if page_size is None:
@@ -539,6 +564,9 @@ def test_flash_attn_kvcache(
             v_cache_paged,
             num_blocks,
         ) = generate_block_kvcache(seqlen_k, page_size, batch_size_cache, nheads_k, d, dv, rng, dtype)
+        k_cache_paged = quantize(k_cache_paged, k_descale)
+        v_cache_paged = quantize(v_cache_paged, v_descale)
+        k_cache, v_cache = cache_rows(k_cache_paged, k_descale), cache_rows(v_cache_paged, v_descale)
     # Note (david): a multi-token row with no visible key is unspecified, so a causal
     # read-only call keeps every query at or past position 0: cache_seqlens >= seqlen_q.
     cache_seqlens = jnp.asarray(
@@ -600,12 +628,12 @@ def test_flash_attn_kvcache(
     if page_size is None:
         caches = (jnp.copy(k_cache), jnp.copy(v_cache))
     else:
-        caches = (interleave_kv(k_cache_paged, v_cache_paged), None)
+        caches = (merge_kv_heads(k_cache_paged, v_cache_paged), None)
     out, lse, *caches_out = flash_attn_with_kvcache(
         q if not varlen_q else q_unpad,
         *caches,
-        k if not new_kv or not varlen_q else k_unpad,
-        v if not new_kv or not varlen_q else v_unpad,
+        k_unpad,
+        v_unpad,
         cache_seqlens=cache_seqlens,
         cache_batch_idx=cache_batch_idx,
         block_table=page_table,
@@ -615,6 +643,9 @@ def test_flash_attn_kvcache(
         softcap=softcap,
         return_softmax_lse=True,
         interpret=INTERPRET,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        nheads_k=nheads_k,
     )
     if varlen_q:
         out = output_pad_fn(out)
@@ -636,8 +667,9 @@ def test_flash_attn_kvcache(
             v_cache_select = v_cache_out if not has_batch_idx else v_cache_out[cache_batch_idx]
         else:
             (kv_cache_out,) = caches_out
-            k_cache_select = gather_paged_cache(kv_cache_out[:, :, 0::2], page_table)[:, :seqlen_k]
-            v_cache_select = gather_paged_cache(kv_cache_out[:, :, 1::2], page_table)[:, :seqlen_k]
+            k_pages_out, v_pages_out = split_kv_heads(kv_cache_out, nheads_k)
+            k_cache_select = cache_rows(k_pages_out, k_descale)
+            v_cache_select = cache_rows(v_pages_out, v_descale)
         assert jnp.array_equal(v_cache_select, v_cache_ref)
         assert jnp.array_equal(k_cache_select, k_cache_ref)
     rtol = 2 if softcap == 0.0 else 3

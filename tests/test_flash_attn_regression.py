@@ -11,7 +11,12 @@ import numpy as np
 import pytest
 
 from flywheel_tpu import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
-from flywheel_tpu.flash_attn_interface import fused_q_scale
+from flywheel_tpu.flash_attn_interface import (
+    default_block_sizes,
+    fused_q_scale,
+    pad_seqlen,
+)
+from flywheel_tpu.pallas.block_sizes import next_pow2
 from tests.test_util import attention_ref, randn
 
 INTERPRET = jax.default_backend() != "tpu"
@@ -170,6 +175,53 @@ def test_flash_attn_varlen_padding_rows_are_zero(seqlens_q, num_pad, causal):
   for index, segment in enumerate(segments):
     rows = slice(int(cu[index]), int(cu[index + 1]))
     assert_output_close(out[rows][None], *segment, causal=causal)
+
+
+@pytest.mark.parametrize("seqlens", [
+    pytest.param([200, 184], id="two_seqs"),
+    pytest.param([250, 6, 3, 125], id="short_seqs_in_clamped_window"),
+    pytest.param([3000, 5000], id="long_two_seqs", marks=pytest.mark.skipif(
+        INTERPRET, reason="interpret mode affords short sequences only")),
+    pytest.param([5500], id="long_one_seq", marks=pytest.mark.skipif(
+        INTERPRET, reason="interpret mode affords short sequences only")),
+    pytest.param([2500, 100, 50, 30], id="long_short_tail",
+                 marks=pytest.mark.skipif(
+                     INTERPRET,
+                     reason="interpret mode affords short sequences only")),
+])
+@pytest.mark.parametrize("causal,window_size", [
+    (False, (-1, -1)),
+    (True, (-1, -1)),
+    (True, (96, 0)),
+])
+def test_flash_attn_varlen_ragged_last_block(seqlens, causal, window_size):
+  # Note (david): a packed total of 128 times an odd count keeps the
+  # max_seqlen-capped block, which does not divide it, so the last q and kv
+  # windows clamp to the padded end and overlap the previous block. Short
+  # sequences inside the clamped window chain the head blend over several
+  # identical windows, and one 5500-token sequence needs the ragged last kv
+  # block that a floored block count would drop.
+  max_seqlen = max(seqlens)
+  padded_total = pad_seqlen(sum(seqlens))
+  max_seqlen_bucket = min(padded_total, next_pow2(max_seqlen))
+  blocks = default_block_sizes(padded_total, padded_total, max_seqlen_bucket,
+                               max_seqlen_bucket, window_size=window_size,
+                               head_dim=128)
+  assert padded_total % blocks.block_q and padded_total % blocks.block_kv
+  q, k, v, segments = packed_qkv(seqlens, 4, 2, 128)
+  cu = cu_seqlens_of(seqlens)
+  out, lse = varlen_attn(q, k, v, cu, cu, max_seqlen, max_seqlen,
+                         causal=causal, window_size=window_size,
+                         return_softmax_lse=True)
+  mask_kwargs = {"causal": causal, "window_size": window_size}
+  for index, segment in enumerate(segments):
+    rows = slice(int(cu[index]), int(cu[index + 1]))
+    assert_output_close(out[rows][None], *segment, **mask_kwargs)
+    _, lse_ref = attention_ref(*segment, **mask_kwargs)
+    _, lse_bf16 = attention_ref(*segment, upcast=False, reorder_ops=True,
+                                **mask_kwargs)
+    lse_error = max_abs(lse[:, rows] - lse_ref[0])
+    assert lse_error <= 2 * max_abs(lse_bf16 - lse_ref) + 1e-3
 
 
 def decode_reference(q, k_cache, v_cache, cache_seqlens, cache_batch_idx,
@@ -372,3 +424,35 @@ def test_flash_attn_with_kvcache_block_table_changes_under_one_executable():
     np.testing.assert_array_equal(slot_kv[..., 1::2, :], v[:, 0])
   assert float(jnp.abs(kv_pages).sum()) == 4 * float(
       jnp.abs(k[0, 0]).sum() + jnp.abs(v[0, 0]).sum())
+
+
+def test_flash_attn_with_kvcache_pads_block_table_to_whole_blocks():
+  # Note (david): 9 pages of 128 tokens divide only into 384-token blocks, so
+  # the kernel takes 1024-token blocks over a table padded to 16 pages. The
+  # rows end inside the first block, on it, one token past it and on the last
+  # real page, so second blocks read padded entries next to real ones.
+  batch, page_size, pages_per_seq = 4, 128, 9
+  heads, heads_k, head_dim = 4, 2, 128
+  num_pages = batch * pages_per_seq
+  keys = jax.random.split(jax.random.PRNGKey(0), 5)
+  q = jax.random.normal(keys[0], (batch, 1, heads, head_dim), jnp.bfloat16)
+  kv_pages = jax.random.normal(
+      keys[1], (num_pages, page_size, 2 * heads_k, head_dim), jnp.bfloat16)
+  k = jax.random.normal(keys[2], (batch, 1, heads_k, head_dim), jnp.bfloat16)
+  v = jax.random.normal(keys[3], (batch, 1, heads_k, head_dim), jnp.bfloat16)
+  table = jax.random.permutation(keys[4], num_pages).astype(
+      jnp.int32).reshape(batch, pages_per_seq)
+  cache_seqlens = jnp.array([129, 1023, 1024, 1151], jnp.int32)
+  rows = jnp.arange(batch)
+  row_kv = kv_pages[table].reshape(
+      batch, pages_per_seq * page_size, 2 * heads_k, head_dim)
+  k_cache = row_kv[..., 0::2, :].at[rows, cache_seqlens].set(k[:, 0])
+  v_cache = row_kv[..., 1::2, :].at[rows, cache_seqlens].set(v[:, 0])
+  out, lse, kv_pages = flash_attn_with_kvcache(
+      q, kv_pages, None, k, v, cache_seqlens=cache_seqlens, block_table=table,
+      return_softmax_lse=True, interpret=INTERPRET)
+  assert_decode_matches(out, lse, q, k_cache, v_cache, cache_seqlens + 1, rows)
+  slot_kv = kv_pages[table[rows, cache_seqlens // page_size],
+                     cache_seqlens % page_size]
+  np.testing.assert_array_equal(slot_kv[..., 0::2, :], k[:, 0])
+  np.testing.assert_array_equal(slot_kv[..., 1::2, :], v[:, 0])
