@@ -10,6 +10,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from .block_sizes import vmem_limit_bytes
+from .copy_utils import interleave_kv_rows
 from .flash_fwd_varlen_paged import flash_attn_varlen_paged
 from .kv_cache_write import INTERLEAVE_STEP_ELEMENTS
 
@@ -70,14 +71,7 @@ def append_kernel(
         # rows go out as whole cache rows in one DMA.
         def _interleave_step(step, carry):
           rows = pl.ds(pl.multiple_of(step * step_rows, step_rows), step_rows)
-          # Note (david): K head h lands in the low and V head h in the high
-          # 16 bits of its row pair's u32 word; the halves move as integers,
-          # so every bit pattern (NaN payloads, subnormals) survives.
-          k_bits = lax.bitcast_convert_type(k_vmem[rows],
-                                            jnp.uint16).astype(jnp.uint32)
-          v_bits = lax.bitcast_convert_type(v_vmem[rows],
-                                            jnp.uint16).astype(jnp.uint32)
-          kv_vmem[rows] = pltpu.bitcast(k_bits | (v_bits << 16), jnp.bfloat16)
+          kv_vmem[rows] = interleave_kv_rows(k_vmem[rows], v_vmem[rows])
           return carry
 
         lax.fori_loop(0, pl.cdiv(num_tokens, step_rows), _interleave_step,
@@ -110,14 +104,21 @@ def append_ragged(
 ) -> jax.Array:
   """Write packed new tokens k, v (total, nheads_k, head_dim) after each
   active request's cache_seqlens into its pages of the merged interleaved
-  (num_pages, page_size, 2 * nheads_k, head_dim) cache; returns the cache."""
+  (num_pages, page_size, merged_cache_heads(nheads_k), head_dim) cache, of
+  k's dtype; returns the cache."""
   # Note (david): a token-row view that leaves the (heads, head_dim) tiling
   # untouched, so XLA emits no copy.
   flat_cache = kv_cache.reshape(-1, *kv_cache.shape[-2:])
   _, num_kv_heads, head_dim = k.shape
+  # Note (david): an odd fp8 head count is staged with the cache's zero pad
+  # head, so the interleave writes whole u32 words.
+  staged_kv_heads = kv_cache.shape[2] // 2
+  head_pad = ((0, 0), (0, staged_kv_heads - num_kv_heads), (0, 0))
+  staged_k, staged_v = jnp.pad(k, head_pad), jnp.pad(v, head_pad)
   hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
   scalar_prefetches = (cu_seqlens_q, cache_seqlens, block_table, num_active)
-  max_step_rows = max(1, INTERLEAVE_STEP_ELEMENTS // (num_kv_heads * head_dim))
+  max_step_rows = max(
+      1, INTERLEAVE_STEP_ELEMENTS // (staged_kv_heads * head_dim))
   step_rows = 1 << (max_step_rows.bit_length() - 1)
   if page_size % step_rows:
     raise ValueError(
@@ -132,9 +133,9 @@ def append_ragged(
           in_specs=(hbm_spec, hbm_spec, hbm_spec),
           out_specs=hbm_spec,
           scratch_shapes=(
-              pltpu.VMEM((page_size, num_kv_heads, head_dim), k.dtype),
-              pltpu.VMEM((page_size, num_kv_heads, head_dim), v.dtype),
-              pltpu.VMEM((page_size, 2 * num_kv_heads, head_dim),
+              pltpu.VMEM((page_size, staged_kv_heads, head_dim), k.dtype),
+              pltpu.VMEM((page_size, staged_kv_heads, head_dim), v.dtype),
+              pltpu.VMEM((page_size, kv_cache.shape[2], head_dim),
                          kv_cache.dtype),
               pltpu.SemaphoreType.DMA((2,)),
           ),
@@ -146,7 +147,8 @@ def append_ragged(
       interpret=pltpu.InterpretParams() if interpret else False,
       name="flash_attn_ragged_cache_append",
   )
-  return call(*scalar_prefetches, k, v, flat_cache).reshape(kv_cache.shape)
+  return call(*scalar_prefetches, staged_k, staged_v,
+              flat_cache).reshape(kv_cache.shape)
 
 
 def flash_attn_kvcache_varlen(
@@ -165,15 +167,19 @@ def flash_attn_kvcache_varlen(
     softcap: float,
     return_lse: bool,
     interpret: bool,
+    nheads_k: int,
+    k_scale: jax.Array,
+    v_scale: jax.Array,
 ) -> tuple[jax.Array, ...]:
   """Append packed new tokens once, then attend with the paged varlen kernel,
   which reads the updated pages only.
 
   q is (total_q, nheads, head_dim) packed by cu_seqlens_q; kv_cache is the
-  merged interleaved (num_pages, page_size, 2 * nheads_k, head_dim) cache and
-  block_table its flat (batch * pages_per_seq,) page table. causal,
-  window_left, softcap and q_scale are flash_attn_varlen_paged's. Returns
-  (out, kv_cache) plus lse (nheads, total_q) float32 when return_lse.
+  merged interleaved (num_pages, page_size, merged_cache_heads(nheads_k),
+  head_dim) cache and block_table its flat (batch * pages_per_seq,) page
+  table. causal, window_left, softcap, q_scale, nheads_k, k_scale and
+  v_scale are flash_attn_varlen_paged's. Returns (out, kv_cache) plus lse
+  (nheads, total_q) float32 when return_lse.
   """
   batch = cu_seqlens_q.shape[0] - 1
   num_query_heads = q.shape[1]
@@ -213,6 +219,7 @@ def flash_attn_kvcache_varlen(
         max_seqlen_q=q.shape[0], max_seqlen_k=pages_per_seq * page_size,
         causal=causal, q_scale=q_scale, return_lse=return_lse,
         interpret=interpret, window_left=window_left, softcap=softcap,
+        nheads_k=nheads_k, k_scale=k_scale, v_scale=v_scale,
     )
     if return_lse:
       out, lse = outputs

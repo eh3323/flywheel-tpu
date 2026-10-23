@@ -2,10 +2,10 @@
 
 Each sequence attends its own cache prefix [0, seqused_k[r]), staged page by
 page through its block table row. The cache is one merged (num_pages,
-page_size, 2 * nheads_k, head_dim) pool whose token rows interleave each kv
-head's K and V rows, [k0, v0, k1, v1, ...]. Every head group is one kv head,
-which stages only its (K, V) row pair of each page, and whose q heads are
-stacked over the rows of every score fragment.
+page_size, cache_heads, head_dim) pool whose token rows interleave the kv
+heads' K and V rows in copy_utils' merged order. Every head group is one kv
+head, which stages only the u32 word rows of each page that hold its K and
+V, and whose q heads are stacked over the rows of every score fragment.
 """
 
 import math
@@ -28,6 +28,7 @@ from .block_sizes import (
   round_up,
   vmem_limit_bytes,
 )
+from .copy_utils import kv_word_rows, resolve_merged_kv_heads
 from .flash_fwd import MIN_Q_TILES_PER_BLOCK
 from .fwd_pipeline import (
   BF16_TILE_ROWS,
@@ -76,6 +77,7 @@ def flash_fwd_varlen_paged_kernel(
     seqused_k_ref: jax.Array,
     cu_qblk_ref: jax.Array,
     block_table_ref: jax.Array,
+    kv_scales_ref: jax.Array,
     q_hbm: jax.Array,
     kv_hbm: jax.Array,
     *refs: jax.Array,
@@ -86,6 +88,7 @@ def flash_fwd_varlen_paged_kernel(
     q_heads_per_kv_head: int,
     bq: int,
     bkv: int,
+    q_scale: float,
     **body,
 ) -> None:
   schedule = make_paged_fwd_schedule(
@@ -98,8 +101,10 @@ def flash_fwd_varlen_paged_kernel(
       causal=causal, left=window_left,
       num_rows=cu_qblk_ref[cu_qblk_ref.shape[0] - 1],
   )
-  # Note (david): K and V share the one merged cache operand.
+  # Note (david): K and V share the one merged cache operand. The K and V
+  # descales arrive in SMEM, so a new descale value compiles no new kernel.
   fwd_body(schedule, q_hbm, kv_hbm, kv_hbm, refs, bq=bq, bkv=bkv, paged=paged,
+           q_scale=q_scale * kv_scales_ref[0], v_scale=kv_scales_ref[1],
            **body)
 
 
@@ -128,9 +133,10 @@ def paged_scratch_shapes(
     return_lse: bool,
     rotary_dtype: jnp.dtype | None,
     gqa_fold: int,
+    kv_dtype: jnp.dtype,
 ) -> list[tuple[tuple[int, ...], jnp.dtype]]:
   """(shape, dtype) of each VMEM scratch buffer forward_common allocates for
-  one paged build, in its order: Q stage, (K, V) pair staging, K and V planes,
+  one paged build, in its order: Q stage, (K, V) word staging, K and V planes,
   bounds rows, Q rotary coefficients, out stage, row max, row sum, f32
   accumulator, lse."""
   bq, bkv = block_sizes.block_q, block_sizes.block_kv
@@ -154,7 +160,7 @@ def paged_scratch_shapes(
     lse_shapes = []
   return [
       (stage_shape, bf16),
-      ((num_stages, bkv, 1, 2, head_dim), bf16),
+      ((num_stages, bkv, 1, kv_word_rows(kv_dtype), head_dim), kv_dtype),
       ((2, bkv, head_dim), bf16),
       ((1, 2, bkv), jnp.dtype(jnp.int32)),
       *rotary_shapes,
@@ -173,6 +179,7 @@ def estimate_vmem_bytes(
     return_lse: bool,
     rotary_dtype: jnp.dtype | None,
     gqa_fold: int,
+    kv_dtype: jnp.dtype,
 ) -> int:
   """Scoped VMEM bytes of one paged build: its scratch plus the score
   temporaries of one compute fragment."""
@@ -180,7 +187,7 @@ def estimate_vmem_bytes(
       vmem_buffer_bytes(shape, dtype)
       for shape, dtype in paged_scratch_shapes(
           block_sizes, head_dim=head_dim, return_lse=return_lse,
-          rotary_dtype=rotary_dtype, gqa_fold=gqa_fold))
+          rotary_dtype=rotary_dtype, gqa_fold=gqa_fold, kv_dtype=kv_dtype))
   temporary_bytes = (
       gqa_fold * block_sizes.block_q_compute * block_sizes.block_kv_compute
       * SCORE_TEMPORARY_BYTES)
@@ -198,6 +205,7 @@ def resolve_paged_tiles(
     rotary_dtype: jnp.dtype | None,
     gqa_fold: int,
     has_window: bool,
+    kv_dtype: jnp.dtype,
     block_sizes: BlockSizes | None = None,
 ) -> BlockSizes:
   """block_sizes of one paged build, whose q sizes count tokens per head.
@@ -249,7 +257,7 @@ def resolve_paged_tiles(
   estimates = {
       blocks: estimate_vmem_bytes(
           blocks, head_dim=head_dim, return_lse=return_lse,
-          rotary_dtype=rotary_dtype, gqa_fold=gqa_fold)
+          rotary_dtype=rotary_dtype, gqa_fold=gqa_fold, kv_dtype=kv_dtype)
       for blocks in candidate_blocks
   }
   fitting = [
@@ -291,36 +299,41 @@ def flash_attn_varlen_paged(
     rotary_interleaved: bool = False,
     window_left: int | None = None,
     softcap: float = 0.0,
+    nheads_k: int | None = None,
+    k_scale: float | jax.Array = 1.0,
+    v_scale: float | jax.Array = 1.0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
   """Packed head-major attention over a paged KV cache, read-only.
 
   q is (nheads, total_q, head_dim) bf16 packed by cu_seqlens_q, whose first
-  entry is 0. kv_cache is the bf16 merged (num_pages, page_size, 2 * nheads_k,
-  head_dim) pool whose token rows interleave each kv head's K and V rows,
-  [k0, v0, k1, v1, ...]. seqused_k is each sequence's kv length with its new
-  tokens, which the cache must already hold; block_table entries past those
-  tokens' pages are never dereferenced. Causal rows align to the end of their
-  sequence's keys; window_left (None unbounded) also hides the keys more than
-  window_left positions before that diagonal. softcap > 0 applies Gemma-2's
-  tanh(s / softcap) * softcap to the scaled scores. q_scale is softmax_scale *
-  log2(e), or softmax_scale / softcap with a softcap. Rows past
-  cu_seqlens_q[-1] are out = 0, lse = -inf. max_seqlen_q and max_seqlen_k
-  only pick the tiles, so an underestimate is slow, not wrong.
-  rotary is prepare_rotary's (q coefficients, None) pair.
+  entry is 0. kv_cache is the merged (num_pages, page_size,
+  merged_cache_heads(nheads_k), head_dim) pool, bf16 or fp8, whose token rows
+  interleave the kv heads' K and V rows (copy_utils' merged order); nheads_k
+  defaults to half its head axis, and an fp8 pool, which pads an odd head
+  count, needs it. An fp8 pool is widened to bf16 once per staged block;
+  k_scale multiplies every score and v_scale the output, both scalars that
+  may be traced. seqused_k is each sequence's kv length with its new tokens,
+  which the cache must already hold; block_table entries past those tokens'
+  pages are never dereferenced.
+  Causal rows align to the end of their sequence's keys; window_left (None
+  unbounded) also hides the keys more than window_left positions before that
+  diagonal. softcap > 0 applies Gemma-2's tanh(s / softcap) * softcap to the
+  scaled scores. q_scale is softmax_scale * log2(e), or softmax_scale /
+  softcap with a softcap. Rows past cu_seqlens_q[-1] are out = 0, lse = -inf.
+  max_seqlen_q and max_seqlen_k only pick the tiles, so an underestimate is
+  slow, not wrong. rotary is prepare_rotary's (q coefficients, None) pair.
   """
   num_q_heads, total_q, head_dim = q.shape
-  if kv_cache.ndim != 4 or kv_cache.shape[2] % 2:
+  if q.dtype != jnp.bfloat16:
+    raise NotImplementedError(
+        f"paged attention takes a bfloat16 q; got {q.dtype}.")
+  if kv_cache.ndim != 4:
     raise ValueError(
-        "kv_cache must be one merged (num_pages, page_size, 2 * nheads_k,"
+        "kv_cache must be one merged (num_pages, page_size, cache_heads,"
         f" head_dim) cache; got {kv_cache.shape}."
     )
   _, page_size, cache_heads, cache_head_dim = kv_cache.shape
-  num_kv_heads = cache_heads // 2
-  if q.dtype != jnp.bfloat16 or kv_cache.dtype != jnp.bfloat16:
-    raise NotImplementedError(
-        "paged attention supports bfloat16 q and cache only; got"
-        f" {q.dtype}, {kv_cache.dtype}."
-    )
+  num_kv_heads = resolve_merged_kv_heads(cache_heads, kv_cache.dtype, nheads_k)
   if cache_head_dim != head_dim or head_dim % NUM_LANES:
     raise ValueError(
         f"head_dim must be a multiple of {NUM_LANES} shared by q and the"
@@ -390,6 +403,7 @@ def flash_attn_varlen_paged(
       gqa_fold=gqa_fold,
       has_window=window_left is not None,
       block_sizes=block_sizes,
+      kv_dtype=kv_cache.dtype,
   )
   bq = block_sizes.block_q
   bkv = block_sizes.block_kv
@@ -422,6 +436,8 @@ def flash_attn_varlen_paged(
       seqused_k.astype(jnp.int32),
       per_seq_qblk_prefix(cu_q, bq),
       block_table.astype(jnp.int32).reshape(-1),
+      jnp.stack([jnp.asarray(scale, jnp.float32).reshape(())
+                 for scale in (k_scale, v_scale)]),
   ]
   kernel = partial(
       flash_fwd_varlen_paged_kernel,

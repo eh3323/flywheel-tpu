@@ -20,6 +20,29 @@ def randn(rng, shape, dtype=jnp.bfloat16):
     return jnp.asarray(rng.standard_normal(shape, dtype=np.float32)).astype(dtype)
 
 
+def merge_kv_heads(k, v):
+    """The merged cache rows of K and V (..., nheads_k, d): per u32 word, its KV heads' K
+    then V; bf16 [k0, v0, k1, v1, ...], fp8 [k0, k1, v0, v1, ...] with an odd nheads_k
+    padded by one zero head."""
+    *leading, nheads_k, d = k.shape
+    heads_per_word = 2 // k.dtype.itemsize
+    head_pad = [(0, 0)] * len(leading) + [(0, -nheads_k % heads_per_word), (0, 0)]
+    k_words, v_words = (
+        jnp.pad(x, head_pad).reshape(*leading, -1, heads_per_word, d) for x in (k, v)
+    )
+    return jnp.stack([k_words, v_words], axis=-3).reshape(*leading, -1, d)
+
+
+def split_kv_heads(kv, nheads_k):
+    """merge_kv_heads' inverse: the (K, V) rows (..., nheads_k, d) of merged cache rows."""
+    *leading, _, d = kv.shape
+    heads_per_word = 2 // kv.dtype.itemsize
+    words = kv.reshape(*leading, -1, 2, heads_per_word, d)
+    return tuple(
+        words[..., part, :, :].reshape(*leading, -1, d)[..., :nheads_k, :] for part in range(2)
+    )
+
+
 def generate_random_padding_mask(max_seqlen, batch_size, rng):
     """(batch_size, max_seqlen) bool prefix masks whose lengths are drawn from
     [max(1, max_seqlen - 20), max_seqlen]."""
