@@ -361,12 +361,14 @@ def start_state_in(hbm_ref: jax.Ref,
                    metadata_ref: MetadataRef,
                    cfg: config.KDAConfig,
                    apply_read_offset: bool = True,
-                   only_flushing: bool = False) -> None:
+                   only_flushing: bool = False,
+                   plane: int | None = None) -> None:
     """Fetch each sequence's initial checkpoint into window position 0.
 
     Only a sequence's first tile reads, and only if it has an initial state.
-    A replay checkpoint has a single slot, so it ignores the read offset; its
-    f32 copy is read only by flushing sequences (only_flushing).
+    A replay checkpoint has a single slot, so it ignores the read offset.
+    plane picks one plane of a split checkpoint; with only_flushing only the
+    flushing sequences read.
     """
     for idx in range(cfg.seq_tile_size):
         record = metadata_ref.get_record(p_id, idx)
@@ -378,8 +380,12 @@ def start_state_in(hbm_ref: jax.Ref,
             read_slot = metadata_ref.s_idx_to_read_indices[s_idx]
         num_states = jnp.where(
             reads_state(record, metadata_ref, only_flushing), 1, 0)
+        if plane is None:
+            state_ref = hbm_ref.at[pl.ds(read_slot, num_states)]
+        else:
+            state_ref = hbm_ref.at[pl.ds(read_slot, num_states), plane]
         pltpu.make_async_copy(
-            hbm_ref.at[pl.ds(read_slot, num_states)],
+            state_ref,
             buf_ref.at[idx, pl.ds(0, num_states)],
             sem,
         ).start()
@@ -587,8 +593,8 @@ def wait_flushed_ckpt_in(buf_ref: jax.Ref, sem: jax.Ref,
                          p_id: int | jax.Array, idx: int,
                          metadata_ref: MetadataRef,
                          cfg: config.KDAConfig) -> None:
-    """Wait, before record idx's flush reads its f32 checkpoint, for the
-    tile's checkpoint reads (start_state_in with only_flushing)."""
+    """Wait, before record idx's flush reads its checkpoint's lo plane, for
+    the tile's lo plane reads (start_state_in with only_flushing)."""
     # Note (david): the reads share one byte-counting semaphore, so a wait
     # sized to one record's read could return on another record's bytes; the
     # tile's first reading record waits for all of them.
