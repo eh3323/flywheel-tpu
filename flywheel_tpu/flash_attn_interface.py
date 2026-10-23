@@ -90,6 +90,10 @@ def default_block_sizes(
   # max_seqlen_q caps the q axis on its own.
   seq_q_cap = max_seqlen if max_seqlen_q is None else max_seqlen_q
   is_dense_band = max_seqlen is None and window_size[0] != -1
+  # Note (david): only the dense grid needs blocks that divide both axes. The
+  # per-seq schedule clamps every window to the padded end, so a packed total
+  # of 128 times an odd count keeps the max_seqlen-capped block, not 128 rows.
+  must_divide = max_seqlen is None
   if is_dense_band:
     # Note (david): the band copies need bq % bkv == 0.
     block_q = default_block(q_seqlen, FWD_BLOCKS)
@@ -97,13 +101,17 @@ def default_block_sizes(
   elif window_size != (-1, -1):
     block_q = default_block(
         q_seqlen, FWD_BLOCKS,
-        WINDOW_BLOCK if seq_q_cap is None else min(seq_q_cap, WINDOW_BLOCK))
+        WINDOW_BLOCK if seq_q_cap is None else min(seq_q_cap, WINDOW_BLOCK),
+        must_divide=must_divide)
     block_kv = default_block(
         kv_seqlen, FWD_BLOCKS,
-        WINDOW_BLOCK if max_seqlen is None else min(max_seqlen, WINDOW_BLOCK))
+        WINDOW_BLOCK if max_seqlen is None else min(max_seqlen, WINDOW_BLOCK),
+        must_divide=must_divide)
   else:
-    block_q = default_block(q_seqlen, FWD_BLOCKS, seq_q_cap)
-    block_kv = default_block(kv_seqlen, FWD_BLOCKS, max_seqlen)
+    block_q = default_block(
+        q_seqlen, FWD_BLOCKS, seq_q_cap, must_divide=must_divide)
+    block_kv = default_block(
+        kv_seqlen, FWD_BLOCKS, max_seqlen, must_divide=must_divide)
   q_compute_tile = pick_tile(FWD_Q_COMPUTE_BLOCKS, block_q)
   if block_q // q_compute_tile < MIN_Q_TILES_PER_BLOCK:
     block_q_compute = q_compute_tile // MIN_Q_TILES_PER_BLOCK
