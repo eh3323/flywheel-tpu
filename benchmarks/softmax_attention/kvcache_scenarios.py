@@ -36,7 +36,10 @@ MAX_FOLDED_QUERY_ROWS query rows per KV head into the query heads of its
 decode kernel, causal through the kernel's query_tokens, and runs a longer
 one on the ragged append plus the paged varlen kernel. rpa sends verify
 windows to the mixed case, as tpu-inference does (max_decode_tokens is 1).
-With --verify-tokens 1 both run their decode path.
+batched_rpa runs vllm-torchtpu's batched RPA (--torchtpu-source) with every
+window in its decode case and decode_query_size = --verify-tokens, as that
+backend serves K + 1 verify tokens; its cache is RPA v3's, its blocks its own
+default. With --verify-tokens 1 every impl runs its decode path.
 
 Only the kernel calls are inside the clock: q, k and v are drawn once and
 reused, so a step's inputs cost nothing. With --trace the scenario also runs
@@ -57,6 +60,7 @@ import numpy as np
 from benchmarks.common.records import recorded, write_record
 from benchmarks.common.rpa import (
     DEFAULT_RPA_SOURCE,
+    load_batched_rpa,
     load_rpa_v3,
     request_distribution,
     unjitted_kernel,
@@ -64,7 +68,7 @@ from benchmarks.common.rpa import (
 from benchmarks.common.timing import time_call
 from benchmarks.softmax_attention import segments as segments_lib
 
-IMPLS = ("flywheel", "rpa")
+IMPLS = ("flywheel", "rpa", "batched_rpa")
 SCENARIOS = ("chunked_prefill", "decode", "verify")
 KERNEL_MARKERS = ("flash_attn", "RPA", "ragged_paged")
 
@@ -357,7 +361,57 @@ def build_rpa(cell, inputs, args):
     return step, (lambda: fill_cache(shape, cell.kv_dtype, generator)), info
 
 
-BUILDERS = {"flywheel": build_flywheel, "rpa": build_rpa}
+def build_batched_rpa(cell, inputs, args):
+    """(step, fresh_state, info) running vllm-torchtpu's batched RPA."""
+    import jax
+    import jax.numpy as jnp
+
+    if args.torchtpu_source is None:
+        raise ValueError("--impl batched_rpa needs --torchtpu-source.")
+    wrapper = load_batched_rpa(args.torchtpu_source)
+    calls, block_table, starts = inputs
+    shape = wrapper.get_kv_cache_shape(
+        cell.num_seqs * block_table.shape[1], cell.page_size, cell.heads_k,
+        cell.head_dim, jnp.dtype(cell.kv_dtype))
+    page_indices = block_table.reshape(-1)
+    if cell.scenario == "chunked_prefill":
+        cu_q_lens = jnp.array([0, cell.chunk], jnp.int32)
+        distribution = request_distribution(num_decode=0, num_seqs=1)
+        new_tokens = cell.chunk
+        decode_query_size = 1
+    else:
+        new_tokens = (cell.verify_tokens if cell.scenario == "verify"
+                      else 1)
+        cu_q_lens = jnp.arange(cell.batch + 1, dtype=jnp.int32) * new_tokens
+        distribution = request_distribution(
+            num_decode=cell.batch, num_seqs=cell.batch)
+        decode_query_size = new_tokens
+    kernel_fn = unjitted_kernel(wrapper)
+    scale = 1.0 / math.sqrt(cell.head_dim)
+
+    def call(cache, q, k, v, start):
+        out, cache = kernel_fn(
+            q, k, v, cache, start + new_tokens, page_indices, cu_q_lens,
+            distribution, sm_scale=scale, sliding_window=cell.sliding_window,
+            decode_query_size=decode_query_size)
+        return out, cache
+
+    kernel = jax.jit(call, donate_argnums=(0,))
+
+    def step(cache):
+        out = None
+        for (q, k, v), start in zip(calls, starts):
+            out, cache = kernel(cache, q, k, v, start)
+        return out, cache
+
+    generator = np.random.default_rng(1)
+    return step, (lambda: fill_cache(shape, cell.kv_dtype, generator)), {
+        "block_source": "batched rpa default",
+        "decode_query_size": decode_query_size}
+
+
+BUILDERS = {"flywheel": build_flywheel, "rpa": build_rpa,
+            "batched_rpa": build_batched_rpa}
 
 
 def trace_scenario(cell, step, state, directory):
@@ -507,6 +561,8 @@ def parse_args(argv=None):
                              "compiles alongside; default: RPA's formula")
     parser.add_argument("--rpa-source", type=pathlib.Path,
                         default=DEFAULT_RPA_SOURCE)
+    parser.add_argument("--torchtpu-source", type=pathlib.Path,
+                        help="batched_rpa: a vllm-torchtpu checkout")
     parser.add_argument("--output", type=pathlib.Path)
     parser.add_argument("--trace", type=pathlib.Path,
                         help="also trace one scenario into this directory")

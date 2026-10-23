@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Time attention over a paged KV cache in serving scenarios, chunked prefill,
-# decode and speculative verify, for flywheel and RPA, with a profiler trace
-# per cell.
+# decode and speculative verify, for flywheel, RPA v3 and vllm-torchtpu's
+# batched RPA, with a profiler trace per cell.
 #
 # Every cell appends to one JSONL. A cell that fails (out of VMEM, or a cache
 # larger than HBM) is recorded as an error and the sweep goes on.
@@ -12,7 +12,9 @@
 #
 # Environment:
 #     PYTHON          interpreter (default: .venv/bin/python)
-#     IMPLS           default "flywheel rpa"
+#     IMPLS           default "flywheel rpa"; batched_rpa needs
+#                     TORCHTPU_SOURCE
+#     TORCHTPU_SOURCE a vllm-torchtpu checkout for batched_rpa
 #     HEADS_K         default "4 32"
 #     DECODE_BATCHES  default "256 128"; empty skips decode
 #     RPA_K32_BLOCKS  RPA blocks at 32 KV heads (default 128,256,128,256);
@@ -33,6 +35,12 @@ export PYTHONPATH=.
 PYTHON=${PYTHON:-.venv/bin/python}
 OUT=${1:-results/benchmark/kvcache_scenarios/$(date +%Y%m%d_%H%M%S)}
 IMPLS=${IMPLS:-"flywheel rpa"}
+TORCHTPU_SOURCE=${TORCHTPU_SOURCE:-}
+if [[ " $IMPLS " == *" batched_rpa "* && -z $TORCHTPU_SOURCE ]]; then
+  echo "IMPLS has batched_rpa: set TORCHTPU_SOURCE to a vllm-torchtpu" \
+       "checkout." >&2
+  exit 1
+fi
 HEADS_K=${HEADS_K:-"4 32"}
 DECODE_BATCHES=${DECODE_BATCHES-"256 128"}
 # At 32 KV heads of 256, RPA's default blocks run out of VMEM on v7x; this is
@@ -52,7 +60,11 @@ has_scenario() { [[ " $SCENARIOS " == *" $1 "* ]]; }
 note() { echo "$*" | tee -a "$OUT/benchmark.log"; }
 
 run() {
+  local source_flags=()
+  [[ -n $TORCHTPU_SOURCE ]] \
+    && source_flags=(--torchtpu-source "$TORCHTPU_SOURCE")
   $PYTHON benchmarks/softmax_attention/kvcache_scenarios.py "$@" \
+      "${source_flags[@]}" \
       --output "$OUT/benchmark.jsonl" --trace "$OUT/traces" \
       >> "$OUT/benchmark.log" 2>&1 \
     || note "failed: $*"
