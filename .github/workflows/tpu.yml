@@ -1,0 +1,66 @@
+# The test suite compiled for the chip on the self-hosted v6e-1 runner, which also runs
+# the long sequences and the GDN/KDA kernels the CPU jobs in ci.yml skip. The chip is one
+# and shared, so a pull request runs here only when a maintainer adds the tpu-test label
+# (remove and re-add it to test a newer push); every push to main runs too. Nothing runs
+# until the repository variable TPU_RUNNER is "true": .github/ci/setup_tpu_runner.sh
+# installs the runner and says when to set it.
+#
+# The label schedules the chip; it is no barrier. A pull request's workflows come from its
+# own merge commit, so a fork can rewrite this file. What keeps untrusted code off the
+# runner is the repository setting that holds outside collaborators' workflows until a
+# maintainer approves them.
+name: tpu
+
+on:
+  pull_request:
+    branches: [main]
+    types: [labeled]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  JAX_VERSION: "0.11.2"
+  # Fail when the chip cannot be opened. Without it jax falls back to CPU, where the tests
+  # switch to interpret mode and pass without touching the TPU.
+  JAX_PLATFORMS: tpu
+  # Skip libtpu's /tmp/libtpu_lockfile. With fs.protected_regular=2, as on the VM, only
+  # the user who created that file can open it, so it locks out the runner even while the
+  # chip is free. The kernel's exclusive open of /dev/vfio/0 still refuses a held chip.
+  ALLOW_MULTIPLE_LIBTPU_LOAD: "1"
+
+jobs:
+  test-tpu:
+    if: >-
+      vars.TPU_RUNNER == 'true' &&
+      (github.event_name != 'pull_request' || github.event.label.name == 'tpu-test')
+    runs-on: [self-hosted, tpu, v6e]
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    # The one runner already runs jobs one at a time; this only drops a superseded run of
+    # the same pull request or branch. At the job level, so other labels cancel nothing.
+    concurrency:
+      group: tpu-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.12"
+          activate-environment: true
+      - name: Install
+        run: uv pip install -e . "jax[tpu]==${JAX_VERSION}" "pytest>=8"
+      # Whoever is benchmarking holds the chip: wait for it, then check it is a v6e.
+      - name: Wait for the chip
+        run: python .github/ci/tpu_wait.py --timeout 3600 --expect-kind v6
+      # One process: only one can open the chip.
+      - name: Test
+        run: python -m pytest -rfE --durations=30 --junitxml=junit-tpu.xml
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-tpu
+          path: junit-tpu.xml
