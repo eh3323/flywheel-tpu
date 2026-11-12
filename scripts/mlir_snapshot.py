@@ -37,6 +37,8 @@ a commit. compare dumps afresh into --out from any tree, then exits 1 if any
 configuration's kernels, wrapper, labels or tuned lookups differ from
 --baseline, printing what differs and the head of a unified diff (SSA value
 names shown as %_, since one inserted op renumbers every later value).
+compare --changed FILE also writes the configurations that differ, with
+their api, as JSON: the TPU CI picks a pull request's tests from it.
 Lowering only: no kernel runs, but the builds read the chip (tuned configs,
 VMEM size), so it runs on a TPU host.
 
@@ -65,7 +67,10 @@ as a wrapper difference.
 Internal entry points (no public wrapper; a commit that moves them updates
 the imports here): softmax_attention.prefill._flash_attn_func_pcp_causal_offset
 (the runtime-offset kernel tpu-inference's PCP attention calls),
-softmax_attention.page.write_kv_cache_pages, and
+softmax_attention.page.write_kv_cache_pages, the MLA entry points
+softmax_attention.mla_prefill.flash_mla_prefill,
+softmax_attention.mla_decode.flash_mla_decode and
+softmax_attention.mla_cache_write.mla_cache_write, and
 softmax_attention.dispatch.lookup / _warn_untuned_once, which the tuned
 lookup record wraps.
 
@@ -105,7 +110,17 @@ import flywheel_tpu
 from flywheel_tpu import linear_attention
 from flywheel_tpu.softmax_attention import dispatch, prefill
 
-# Note: the page writer has no public wrapper.
+# Note: the page writer and the MLA kernels have no public wrapper.
+from flywheel_tpu.softmax_attention.kernels.mla_decode import (
+    LATENT_DIM,
+    ROPE_DIM,
+)
+from flywheel_tpu.softmax_attention.mla_cache_write import mla_cache_write
+from flywheel_tpu.softmax_attention.mla_decode import (
+    flash_mla_decode,
+    mla_cache_shape,
+)
+from flywheel_tpu.softmax_attention.mla_prefill import flash_mla_prefill
 from flywheel_tpu.softmax_attention.page import write_kv_cache_pages
 
 FORMAT_VERSION = 2
@@ -1071,6 +1086,181 @@ def kv_write_cases() -> list[Case]:
     ]
 
 
+def mla_cache(
+    batch: int, pages_per_seq: int, page_size: int, dtype: Any
+) -> dict[str, jax.ShapeDtypeStruct]:
+    """A paged MLA latent cache with a page per request page, its block
+    table and kv_lens, plus the kv_scale an fp8 cache takes."""
+    arrays = dict(
+        kv_cache=spec(
+            mla_cache_shape(batch * pages_per_seq, page_size, dtype), dtype
+        ),
+        kv_lens=spec((batch,), I32),
+        block_table=spec((batch, pages_per_seq), I32),
+    )
+    if dtype == FP8_E4M3:
+        arrays["kv_scale"] = spec((), F32)
+    return arrays
+
+
+def mla_decode_cases() -> list[Case]:
+    """flash_mla_decode: the append, then absorbed MLA decode on the cache."""
+    api = "flash_mla_decode"
+    sm_scale = (LATENT_DIM + ROPE_DIM) ** -0.5
+
+    def _decode(
+        batch: int,
+        query_tokens: int,
+        heads: int,
+        pages_per_seq: int,
+        page_size: int,
+        dtype: Any,
+    ) -> dict[str, jax.ShapeDtypeStruct]:
+        return dict(
+            q_nope=spec((batch, query_tokens, heads, LATENT_DIM)),
+            q_pe=spec((batch, query_tokens, heads, ROPE_DIM)),
+            new_kv_c=spec((batch, query_tokens, LATENT_DIM), dtype),
+            new_k_pe=spec((batch, query_tokens, ROPE_DIM), dtype),
+        ) | mla_cache(batch, pages_per_seq, page_size, dtype)
+
+    return [
+        # Note: 16 requests of one token at 128 heads over 4096 tokens hit
+        # the tuned table in both cache dtypes.
+        Case(
+            "mla_decode_bf16_h128_tuned",
+            api,
+            flash_mla_decode,
+            _decode(16, 1, 128, 64, 64, BF16),
+            dict(sm_scale=sm_scale),
+        ),
+        Case(
+            "mla_decode_fp8_h128_tuned",
+            api,
+            flash_mla_decode,
+            _decode(16, 1, 128, 64, 64, FP8_E4M3),
+            dict(sm_scale=sm_scale),
+        ),
+        # Note: an untuned batch within WHOLE_REQUEST_TOKENS takes a whole
+        # request per KV block; s_q > 1 runs the causal kernel.
+        Case(
+            "mla_decode_bf16_sq4_h16_ps512_causal_lse",
+            api,
+            flash_mla_decode,
+            _decode(6, 4, 16, 4, 512, BF16),
+            dict(sm_scale=sm_scale, return_lse=True),
+        ),
+        Case(
+            "mla_decode_bf16_sq2_h128_full_bf16_scores",
+            api,
+            flash_mla_decode,
+            _decode(6, 2, 128, 32, 64, BF16),
+            dict(sm_scale=sm_scale, causal=False, s_dtype=BF16),
+        ),
+        # Note: past a lane tile of requests the lse spans a second lane
+        # group.
+        Case(
+            "mla_decode_fp8_b130_h16_lse",
+            api,
+            flash_mla_decode,
+            _decode(130, 1, 16, 1, 64, FP8_E4M3),
+            dict(sm_scale=sm_scale, return_lse=True),
+        ),
+    ]
+
+
+def mla_prefill_cases() -> list[Case]:
+    """flash_mla_prefill: a ragged chunk attending its requests' cache."""
+    api = "flash_mla_prefill"
+    sm_scale = (LATENT_DIM + ROPE_DIM) ** -0.5
+
+    def _prefill(
+        num_tokens: int,
+        heads: int,
+        batch: int,
+        pages_per_seq: int,
+        page_size: int,
+        dtype: Any,
+    ) -> dict[str, jax.ShapeDtypeStruct]:
+        return dict(
+            q_nope=spec((num_tokens, heads, LATENT_DIM)),
+            q_pe=spec((num_tokens, heads, ROPE_DIM)),
+            cu_q_lens=spec((batch + 1,), I32),
+        ) | mla_cache(batch, pages_per_seq, page_size, dtype)
+
+    return [
+        Case(
+            "mla_prefill_bf16_h128_causal",
+            api,
+            flash_mla_prefill,
+            _prefill(512, 128, 4, 32, 64, BF16),
+            dict(sm_scale=sm_scale, max_seqlen_q=256, max_seqlen_k=2048),
+        ),
+        Case(
+            "mla_prefill_fp8_h16_ps512_full_lse",
+            api,
+            flash_mla_prefill,
+            _prefill(512, 16, 4, 4, 512, FP8_E4M3),
+            dict(
+                sm_scale=sm_scale,
+                causal=False,
+                return_lse=True,
+                max_seqlen_q=256,
+                max_seqlen_k=2048,
+            ),
+        ),
+        # Note: a page of three bf16 cache tiles is no power of two.
+        Case(
+            "mla_prefill_bf16_h8_ps48",
+            api,
+            flash_mla_prefill,
+            _prefill(256, 8, 2, 24, 48, BF16),
+            dict(sm_scale=sm_scale, max_seqlen_q=128, max_seqlen_k=1100),
+        ),
+        Case(
+            "mla_prefill_bf16_h64_long",
+            api,
+            flash_mla_prefill,
+            _prefill(4096, 64, 1, 128, 64, BF16),
+            dict(sm_scale=sm_scale, max_seqlen_q=4096, max_seqlen_k=8192),
+        ),
+    ]
+
+
+def mla_cache_write_cases() -> list[Case]:
+    """mla_cache_write: a ragged chunk of new latents written to its pages."""
+    api = "mla_cache_write"
+
+    def _write(
+        num_tokens: int, page_size: int, dtype: Any
+    ) -> dict[str, jax.ShapeDtypeStruct]:
+        arrays = dict(
+            new_kv_c=spec((num_tokens, LATENT_DIM), dtype),
+            new_k_pe=spec((num_tokens, ROPE_DIM), dtype),
+            cu_q_lens=spec((5,), I32),
+        ) | mla_cache(4, 16, page_size, dtype)
+        # Note: the write copies the fp8 values as they are, with no scale.
+        arrays.pop("kv_scale", None)
+        return arrays
+
+    return [
+        Case(
+            "mla_cache_write_bf16",
+            api,
+            mla_cache_write,
+            _write(1024, 64, BF16),
+            {},
+        ),
+        # Note: a T of no whole cache tiles is padded to them first.
+        Case(
+            "mla_cache_write_fp8_padded",
+            api,
+            mla_cache_write,
+            _write(1000, 512, FP8_E4M3),
+            {},
+        ),
+    ]
+
+
 def linear_attention_case(
     name: str,
     kernel: str,
@@ -1150,6 +1340,11 @@ def linear_attention_cases() -> list[Case]:
         linear_attention_case(
             "gdn_prefill_decode_bf16_precision", "gdn", **bf16_precision
         ),
+        # Note: split_out_heads changes the kernel's output stage, which no
+        # other configuration reaches.
+        linear_attention_case(
+            "gdn_prefill_decode_split_out_heads", "gdn", split_out_heads=True
+        ),
         linear_attention_case(
             "gdn_spec_tokens_no_conv_bias",
             "gdn",
@@ -1199,6 +1394,9 @@ def all_cases() -> list[Case]:
         *varlen_cases(),
         *kvcache_cases(),
         *kv_write_cases(),
+        *mla_decode_cases(),
+        *mla_prefill_cases(),
+        *mla_cache_write_cases(),
         *linear_attention_cases(),
     ]
     names = [case.name for case in cases]
@@ -1737,8 +1935,9 @@ def compare_snapshots(
     candidate_dir: pathlib.Path,
     only: str | None,
     max_diff_lines: int,
-) -> bool:
-    """Print every difference; True when the snapshots match."""
+) -> list[str] | None:
+    """Print every difference; return the configurations that differ, or
+    None when the environments differ and no IR is comparable."""
     baseline, candidate = load_index(baseline_dir), load_index(candidate_dir)
     print_source("baseline ", baseline["source"])
     print_source("candidate", candidate["source"])
@@ -1756,18 +1955,18 @@ def compare_snapshots(
             f" {baseline['environment']}\n  candidate"
             f" {candidate['environment']}"
         )
-        return False
+        return None
     baseline_names = [
         name
         for name in baseline["configs"]
         if only is None or re.search(only, name)
     ]
     candidate_names = list(candidate["configs"])
-    is_match = True
+    changed = set()
     for name in sorted(set(baseline_names) ^ set(candidate_names)):
         side = "baseline" if name in baseline["configs"] else "candidate"
         print(f"MISSING {name}: only in the {side}")
-        is_match = False
+        changed.add(name)
     for name in baseline_names:
         if name not in candidate["configs"]:
             continue
@@ -1776,7 +1975,7 @@ def compare_snapshots(
         baseline_text = (baseline_dir / f"{name}.mlir").read_text("utf-8")
         candidate_text = (candidate_dir / f"{name}.mlir").read_text("utf-8")
         if baseline_text != candidate_text:
-            is_match = False
+            changed.add(name)
             changed_calls = describe_changed_calls(
                 baseline_text, candidate_text, baseline_config["calls"]
             )
@@ -1789,7 +1988,7 @@ def compare_snapshots(
         baseline_wrapper = (baseline_dir / wrapper_file).read_text("utf-8")
         candidate_wrapper = (candidate_dir / wrapper_file).read_text("utf-8")
         if baseline_wrapper != candidate_wrapper:
-            is_match = False
+            changed.add(name)
             if is_line_permutation(baseline_wrapper, candidate_wrapper):
                 note = ": same lines reordered or rewired"
             else:
@@ -1803,14 +2002,14 @@ def compare_snapshots(
             ):
                 print(f"    {line}")
         if baseline_config["calls"] != candidate_config["calls"]:
-            is_match = False
+            changed.add(name)
             print(
                 f"LABELS DIFFER {name}:\n  baseline "
                 f" {baseline_config['calls']}\n  candidate"
                 f" {candidate_config['calls']}"
             )
         if baseline_config["tuned"] != candidate_config["tuned"]:
-            is_match = False
+            changed.add(name)
             keys = sorted(
                 set(baseline_config["tuned"]) | set(candidate_config["tuned"])
             )
@@ -1821,9 +2020,33 @@ def compare_snapshots(
                 if baseline_outcome != candidate_outcome:
                     print(f"  {key}: {baseline_outcome} -> {candidate_outcome}")
     num_compared = sum(name in candidate["configs"] for name in baseline_names)
-    verdict = "PASS" if is_match else "FAIL"
+    verdict = "FAIL" if changed else "PASS"
     print(f"{verdict}: compared {num_compared} configurations")
-    return is_match
+    return sorted(changed)
+
+
+def write_changed(
+    path: pathlib.Path,
+    baseline_dir: pathlib.Path,
+    candidate_dir: pathlib.Path,
+    changed: list[str] | None,
+) -> None:
+    """The --changed report: every configuration that differs, by name, with
+    the api its index entry names (the candidate's, or the baseline's for a
+    configuration the candidate dropped)."""
+    if changed is None:
+        report = dict(comparable=False, configs={})
+    else:
+        baseline = load_index(baseline_dir)["configs"]
+        candidate = load_index(candidate_dir)["configs"]
+        report = dict(
+            comparable=True,
+            configs={
+                name: candidate.get(name, baseline.get(name))["api"]
+                for name in changed
+            },
+        )
+    path.write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
 
 
 def main() -> None:
@@ -1860,6 +2083,14 @@ def main() -> None:
         default=40,
         help="unified diff lines printed per differing file",
     )
+    compare_parser.add_argument(
+        "--changed",
+        type=pathlib.Path,
+        help=(
+            "also write here, as JSON, each configuration that differs with"
+            " its api (or comparable: false when the environments differ)"
+        ),
+    )
     args = parser.parse_args()
     if args.command == "dump":
         dump(args.out, args.only, require_clean=True)
@@ -1867,9 +2098,12 @@ def main() -> None:
         # Note: read the baseline before lowering, so a bad path fails fast.
         load_index(args.baseline)
         dump(args.out, args.only, require_clean=False)
-        if not compare_snapshots(
+        changed = compare_snapshots(
             args.baseline, args.out, args.only, args.diff_lines
-        ):
+        )
+        if args.changed is not None:
+            write_changed(args.changed, args.baseline, args.out, changed)
+        if changed is None or changed:
             sys.exit(1)
 
 

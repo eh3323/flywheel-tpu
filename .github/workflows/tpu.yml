@@ -1,0 +1,145 @@
+# TPU tests on the shared v6e, through the self-hosted runner that
+# .github/ci/setup_tpu_runner.sh sets up there (#49).
+#
+# A pull request runs its tests when a maintainer adds the `ready` label. The
+# run tests the head commit the label was added on, not the branch, and the
+# label comes off as the run starts, so commits pushed later run only once a
+# maintainer adds it again. tpu_job.sh compares the IR of every configuration
+# in scripts/mlir_snapshot.py with the merge base's, then runs the tests of
+# every kernel whose IR changed and every test file the pull request adds or
+# changes (.github/ci/tpu_tests.py).
+#
+# Weekly, the whole suite runs from Saturday 00:00 to 16:00 New York time;
+# what the window leaves unrun is listed in the run's summary. Every TPU job
+# holds /tmp/tpu.lock, as the benchmarks and evals do.
+#
+# pull_request_target runs this file and tpu_job.sh as main has them, so a
+# pull request cannot change what runs on the VM itself. Its code runs only
+# inside tpu_job.sh's containers, with no network and no secrets, and the
+# job's token can only read the repository.
+name: tpu
+
+on:
+  pull_request_target:  # zizmor: ignore[dangerous-triggers] see above
+    types: [labeled]
+    branches: [main]
+  # Note: cron runs in UTC, so both offsets of New York time are scheduled
+  # and `plan` keeps the one that is midnight there.
+  schedule:
+    - cron: "0 4 * * 6"
+    - cron: "0 5 * * 6"
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: Hours the full suite may run
+        default: "16"
+
+permissions: {}
+
+# Note: one group per pull request and label, so another label leaves a run
+# alone and `ready` added again replaces it.
+concurrency:
+  group: tpu-${{ github.event_name }}-${{ github.event.pull_request.number }}-${{ github.event.label.name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
+
+env:
+  # Keep in step with ci.yml and pyproject.toml.
+  JAX_VERSION: "0.11.2"
+
+jobs:
+  plan:
+    if: >-
+      github.event_name != 'pull_request_target'
+      || github.event.label.name == 'ready'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    outputs:
+      run: ${{ steps.plan.outputs.run }}
+      deadline: ${{ steps.plan.outputs.deadline }}
+    steps:
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          HOURS: ${{ inputs.hours }}
+          PR: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          case "$EVENT" in
+            pull_request_target)
+              gh api --method DELETE "repos/$REPO/issues/$PR/labels/ready" \
+                > /dev/null
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              ;;
+            schedule)
+              offset=$(TZ=America/New_York date +%z)
+              case "$SCHEDULE $offset" in
+                "0 4 * * 6 -0400" | "0 5 * * 6 -0500") ;;
+                *)
+                  echo "Not midnight in New York at this offset ($offset)."
+                  echo "run=false" >> "$GITHUB_OUTPUT"
+                  exit 0
+                  ;;
+              esac
+              day=$(TZ=America/New_York date +%F)
+              deadline=$(TZ=America/New_York date -d "$day 16:00" +%s)
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              echo "deadline=$deadline" >> "$GITHUB_OUTPUT"
+              ;;
+            workflow_dispatch)
+              deadline=$(( $(date +%s) + HOURS * 3600 ))
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              echo "deadline=$deadline" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+  test-tpu:
+    needs: plan
+    if: needs.plan.outputs.run == 'true'
+    runs-on: [self-hosted, tpu-v6e]
+    # The lock may be held for hours before the tests start.
+    timeout-minutes: 2880
+    permissions:
+      contents: read
+    steps:
+      # main's tpu_job.sh and tpu.Dockerfile, whatever the event.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          path: trusted
+          persist-credentials: false
+      - if: github.event_name == 'pull_request_target'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          path: src
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - if: github.event_name == 'pull_request_target'
+        name: Test the pull request
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: trusted/.github/ci/tpu_job.sh pr src "$BASE_SHA" out
+      - if: github.event_name != 'pull_request_target'
+        name: Test the whole suite
+        env:
+          DEADLINE: ${{ needs.plan.outputs.deadline }}
+        run: trusted/.github/ci/tpu_job.sh full trusted "$DEADLINE" out
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: tpu-${{ github.run_id }}
+          path: |
+            out/*.xml
+            out/*.txt
+            out/*.md
+            out/*.json
+          if-no-files-found: ignore
+      # tpu_job.sh removes its containers when it exits; this catches a job
+      # cancelled before it could.
+      - if: always()
+        run: >
+          docker ps -aq --filter label=flywheel-tpu-ci
+          | xargs -r docker rm -f
